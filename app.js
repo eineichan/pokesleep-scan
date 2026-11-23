@@ -1,7 +1,7 @@
-import {rankIcons} from './icon-match.js';
-import {cachedCatalog,checkCatalog} from './catalog-update.js';
-import {isDetailScreen} from './image-check.js';
-import Reader from './reader.js';
+import {rankIcons} from './icon-match.js?v=20261123c';
+import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123c';
+import {isDetailScreen} from './image-check.js?v=20261123c';
+import Reader from './reader.js?v=20261123c';
 const $=id=>document.getElementById(id);
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
 let catalogStorage;try{catalogStorage=localStorage}catch{catalogStorage={getItem:()=>null,setItem:()=>{throw Error('保存不可')}}}

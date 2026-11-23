@@ -5544,9 +5544,11 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     const lineHeight = Math.max(a.line.y1 - a.line.y0, b.line.y1 - b.line.y0);
     return Math.abs(a.line.y0 - b.line.y0) <= lineHeight ? a.line.x0 - b.line.x0 : a.line.y0 - b.line.y0;
   }).map((item) => item.name);
-  // ピル単位で読み取れたサブスキルは位置順に信頼できるので、行OCRの推定より優先する。
+  // ピル単位で読み取れたサブスキルは解放レベルごとの位置に並ぶので、行OCRの推定より優先する。
   // 3つ未満しか読めないとき（縮小された画像など）は従来の行OCRの結果を使う。
-  const subSkillList = subSkillPillNameList && subSkillPillNameList.length >= 3 ? subSkillPillNameList : subSkillLineNameList;
+  const pillNameList = (subSkillPillNameList ?? []).slice(0, 5);
+  const pillCount = pillNameList.filter((name) => name != null).length;
+  const subSkillList = pillCount >= 3 ? pillNameList : subSkillLineNameList;
   const nature = nature_default.list.map((item) => ({ name: item.name, match: findBestLine(item.name, lineList) })).toSorted((a, b) => b.match.score - a.match.score)[0];
   const result = {
     name: parsedName || null,
@@ -6042,17 +6044,26 @@ function findSubSkillPillRegionList(sourceCanvas, band) {
     for (let x = 0; x < width; x++) rowCount[y] += mask[y * width + x];
   }
   const rowList = subSkillRunList(rowCount.map((count) => count > width * 0.02), 14).map(([start, end]) => [start + band.y0, end + band.y0]).filter(([start, end]) => end - start >= 40 && end - start <= 260);
-  const regionList = [];
-  for (const [rowStart, rowEnd] of rowList) {
+  // ピルが並ぶ行だけを拾う（メインスキルの枠の行は候補が0個になる）。
+  const pillRowList = rowList.map(([rowStart, rowEnd]) => {
     const columnCount = new Array(width).fill(0);
     for (let y = rowStart; y <= rowEnd; y++) {
       for (let x = 0; x < width; x++) columnCount[x] += mask[(y - band.y0) * width + x];
     }
     const columnList = subSkillRunList(columnCount.map((count) => count > 2), 16).filter(([start, end]) => end - start >= width * 0.18 && end - start <= width * 0.55);
+    return { rowStart, rowEnd, columnList };
+  }).filter((row) => row.columnList.length).slice(-3);
+  const regionList = [];
+  pillRowList.forEach(({ rowStart, rowEnd, columnList }, rowIndex) => {
     for (const [columnStart, columnEnd] of columnList) {
-      regionList.push({ x: columnStart, y: rowStart, width: columnEnd - columnStart + 1, height: rowEnd - rowStart + 1 });
+      // ピルは Lv10/Lv25, Lv50/Lv70, Lv80 の3段2列。位置から解放レベルを決めておくと、
+      // 1つ読み取れなくても残りが上のレベルへずれない。
+      const slot = rowIndex * 2 + (columnStart > width * 0.45 ? 1 : 0);
+      if (slot <= 4 && !regionList.some((region) => region.slot == slot)) {
+        regionList.push({ x: columnStart, y: rowStart, width: columnEnd - columnStart + 1, height: rowEnd - rowStart + 1, slot });
+      }
     }
-  }
+  });
   return regionList;
 }
 // ピルの中の文字の行（Lv.50 のような鍵バッジは避ける）を切り出し、濃淡を伸ばして拡大する。
@@ -6066,19 +6077,36 @@ function createSubSkillLineCanvas(sourceCanvas, region, option) {
   const height = region.height - border * 2;
   if (width < 20 || height < 16) return null;
   const { gray } = subSkillRegionGray(sourceCanvas, region.x + border, region.y + border, width, height);
-  const threshold = 190;
+  // ロック中のピルは淡い灰色の文字、解放済みは濃い文字。背景の明るさから閾値を決める。
+  const sortedGray = Array.from(gray).sort((left, right) => left - right);
+  const background = sortedGray[Math.floor(sortedGray.length * 0.9)] ?? 250;
+  const darkest = sortedGray[Math.floor(sortedGray.length * 0.02)] ?? 0;
+  const threshold = Math.min(242, Math.max(120, background - Math.max(14, (background - darkest) * 0.32)));
+  // 鍵バッジや枠線は濃い色が長く続く。文字の画は細いので、長い塊を文字の行から外す。
+  const blockThreshold = Math.max(70, Math.min(threshold - 20, background - 60));
   const rowInk = new Array(height).fill(0);
   const columnInk = new Array(width).fill(0);
+  const rowIsBlock = new Array(height).fill(false);
   for (let y = 0; y < height; y++) {
+    let run = 0;
+    let longestRun = 0;
     for (let x = 0; x < width; x++) {
-      if (gray[y * width + x] < threshold) {
+      const value = gray[y * width + x];
+      if (value < threshold) {
         rowInk[y]++;
         columnInk[x]++;
       }
+      if (value < blockThreshold) {
+        run++;
+        if (run > longestRun) longestRun = run;
+      } else {
+        run = 0;
+      }
     }
+    rowIsBlock[y] = longestRun >= width * 0.12;
   }
   // 端から端まで埋まった行・列は枠線なので文字の行から除く。
-  const rowFlagList = rowInk.map((count) => count > width * 0.01 && count < width * 0.7);
+  const rowFlagList = rowInk.map((count, y) => count > width * 0.01 && count < width * 0.7 && !rowIsBlock[y]);
   const columnIsText = columnInk.map((count) => count < height * 0.7);
   const lineList = subSkillRunList(rowFlagList, 3).map(([start, end]) => {
     const hitList = new Uint8Array(width);
@@ -6092,7 +6120,8 @@ function createSubSkillLineCanvas(sourceCanvas, region, option) {
       }
     }
     return { start, end, ink, coverage: hitList.reduce((sum, value) => sum + value, 0) };
-  }).filter((line) => line.end - line.start >= 8);
+    // 文字はピルの中央に寄る。端から端まで届く行（枠線・鍵バッジの縁）は文字の行ではない。
+  }).filter((line) => line.end - line.start >= 8 && line.coverage <= width * 0.82);
   if (!lineList.length) return null;
   const line = lineList.toSorted((left, right) => right.coverage - left.coverage || right.ink - left.ink)[0];
   const lineY = Math.max(0, line.start - Math.round(height * padding));
@@ -6142,6 +6171,27 @@ function createSubSkillLineCanvas(sourceCanvas, region, option) {
   context.putImageData(imageData, 0, 0);
   return canvas;
 }
+// 漢字は1画ちがいで別の字に読めやすい（材/林、率/奉、持/待…）。文字の並び（2文字組）の
+// 一致と編集距離を合わせて見て、1〜2文字化けても正しいサブスキルに寄せる。
+function getCharacterBigramRecall(expected, actual) {
+  const expectedText = normalizeText(expected);
+  const actualText = normalizeText(actual);
+  if (expectedText.length < 2 || actualText.length < 2) return 0;
+  const actualGramList = new Set();
+  for (let index = 0; index < actualText.length - 1; index++) actualGramList.add(actualText.slice(index, index + 2));
+  let hit = 0;
+  let total = 0;
+  for (let index = 0; index < expectedText.length - 1; index++) {
+    total++;
+    if (actualGramList.has(expectedText.slice(index, index + 2))) hit++;
+  }
+  return total ? hit / total : 0;
+}
+function getSubSkillSimilarity(expected, actual) {
+  const editScore = getTextSimilarity(expected, actual);
+  const bigramScore = getCharacterBigramRecall(expected, actual);
+  return editScore * 0.55 + bigramScore * 0.45;
+}
 function selectSubSkillName(recognizedText) {
   const cleaned = normalizeText(recognizedText).replace(/Lv\.?[0-9]+/gi, "");
   if (!cleaned) return null;
@@ -6149,8 +6199,15 @@ function selectSubSkillName(recognizedText) {
   const sizeMatch = cleaned.match(/([SML])$/);
   const sizeFilteredList = sizeMatch ? sub_skill_default.list.filter((subSkill) => subSkill.name.endsWith(sizeMatch[1])) : [];
   const candidateList = sizeFilteredList.length ? sizeFilteredList : sub_skill_default.list;
-  const best = candidateList.map((subSkill) => ({ name: subSkill.name, score: getTextSimilarity(subSkill.name, cleaned) })).toSorted((left, right) => right.score - left.score)[0];
-  return best && best.score >= 0.62 ? best.name : null;
+  const scoreList = candidateList.map((subSkill) => ({
+    name: subSkill.name,
+    score: Math.max(getTextSimilarity(subSkill.name, cleaned), getSubSkillSimilarity(subSkill.name, cleaned))
+  })).toSorted((left, right) => right.score - left.score);
+  const [best, second] = scoreList;
+  if (!best || best.score < 0.5) return null;
+  // 1位と2位が僅差のときは読み取りが足りていないので、確信を持てるまで返さない。
+  if (second && best.score < 0.62 && best.score - second.score < 0.06) return null;
+  return best.name;
 }
 async function recognizeSubSkillNameList(sourceCanvas, worker) {
   const regionList = findSubSkillPillRegionList(sourceCanvas, findSubSkillBand(sourceCanvas));
@@ -6159,14 +6216,16 @@ async function recognizeSubSkillNameList(sourceCanvas, worker) {
     tessedit_pageseg_mode: import_tesseract.default.PSM.SINGLE_LINE,
     preserve_interword_spaces: "0"
   });
-  const nameList = [];
+  // 解放レベル（Lv10/Lv25/Lv50/Lv70/Lv80）ごとの枠に、読めた名前だけを入れる。
+  const slotNameList = new Array(5).fill(null);
   try {
-    // 時間がかかりすぎないよう、候補は上から順に最大8個まで見る（5つ読めたら終了）。
-    for (const region of regionList.slice(0, 8)) {
-      if (nameList.length >= 5) break;
+    for (const region of regionList) {
+      const slot = region.slot ?? slotNameList.findIndex((name) => name == null);
+      if (slot < 0 || slot >= 5 || slotNameList[slot] != null) continue;
       const optionList = [
         { scale: 3, padding: 0.05, darkRate: 0.02, lightRate: 0.9 },
-        { scale: 4, padding: 0.08, darkRate: 0.01, lightRate: 0.8 }
+        { scale: 4, padding: 0.08, darkRate: 0.01, lightRate: 0.85 },
+        { scale: 3, padding: 0.1, darkRate: 0.06, lightRate: 0.75 }
       ];
       let name = null;
       for (const option of optionList) {
@@ -6176,7 +6235,8 @@ async function recognizeSubSkillNameList(sourceCanvas, worker) {
         name = selectSubSkillName(result.data.text);
         if (name) break;
       }
-      if (name && !nameList.includes(name)) nameList.push(name);
+      // 同じサブスキルが2つ並ぶことはないので、既に読めた名前は別の枠へ回さない。
+      if (name && !slotNameList.includes(name)) slotNameList[slot] = name;
     }
   } finally {
     await worker.setParameters({
@@ -6184,7 +6244,7 @@ async function recognizeSubSkillNameList(sourceCanvas, worker) {
       preserve_interword_spaces: "1"
     });
   }
-  return nameList.slice(0, 5);
+  return slotNameList;
 }
 
 var PokemonStatusImageReader = class {
