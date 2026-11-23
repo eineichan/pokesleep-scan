@@ -1,9 +1,9 @@
-import {rankIcons} from './icon-match.js?v=20261123e';
-import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123e';
-import {detailScreenCheck} from './image-check.js?v=20261123e';
-import Reader from './reader.js?v=20261123e';
+import {rankIcons} from './icon-match.js?v=20261123f';
+import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123f';
+import {detailScreenCheck} from './image-check.js?v=20261123f';
+import Reader from './reader.js?v=20261123f';
 const $=id=>document.getElementById(id);
-const VERSION='20261123e';
+const VERSION='20261123f';
 const DEBUG=new URLSearchParams(location.search).get('debug')==='1';
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
 let catalogStorage;try{catalogStorage=localStorage}catch{catalogStorage={getItem:()=>null,setItem:()=>{throw Error('保存不可')}}}
@@ -158,23 +158,37 @@ async function icon(url){
 }
 // 種族はアイコンから決める。アイコンの候補が僅差のときだけ、画面から読めた
 // メインスキル・食材を「どちららしいか」の手がかりに使う（値を埋めるのには使わない）。
+// 「ほっぺすりすり (げんきエールS)」のような併記つきのスキル名を、画面の表記と比べる。
+function skillMatches(catalogSkill,readSkill){
+ if(!catalogSkill||!readSkill)return false;
+ const aliasList=[catalogSkill,catalogSkill.replace(/\(.+\)$/,'').trim()];
+ const inside=catalogSkill.match(/\((.+)\)$/)?.[1];if(inside)aliasList.push(inside.trim());
+ return aliasList.includes(readSkill);
+}
 function pickSpecies(match,r){
  const ranking=match.ranking||[],best=ranking[0],estimate=r.pokemonName||'';
  const compatibility=name=>{
   const mon=db.mons.find(m=>m.name===name);
   if(!mon)return -1;
   let score=0;
-  if(r.mainSkillName&&mon.skill===r.mainSkillName)score+=2;
+  if(r.mainSkillName&&skillMatches(mon.skill,r.mainSkillName))score+=2;
   (r.foodList||[]).forEach((food,index)=>{if(food&&(mon.foodSlots?.[index]||[]).includes(food))score++});
   return score;
  };
  if(!best)return {name:estimate,confident:false};
  if(estimate&&best.name===estimate)return {name:estimate,confident:true};
  const estimateScore=estimate?compatibility(estimate):-1,bestScore=compatibility(best.name);
- if(estimate&&estimateScore>=3&&estimateScore>=bestScore&&best.distance>26)return {name:estimate,confident:false};
+ // アイコンの1位と2位が僅差（gap<8）のときは、アイコンだけでは決められない。
+ // 画面のメインスキル・食材と合う種族が別にいるなら、そちらを採る（要確認つき）。
+ // 例: 白くて丸い種族が密集しているため、トゲデマルがアブリーへ転びやすい。
+ if(estimate&&estimateScore>=2&&estimateScore>bestScore&&(best.distance>26||best.gap<8))return {name:estimate,confident:false};
  if(best.distance<=26&&best.gap>=5)return {name:best.name,confident:true};
  if(best.distance<=40&&bestScore>=3)return {name:best.name,confident:true};
  if(estimate&&estimateScore>=3)return {name:estimate,confident:false};
+ // アイコンが名前パネルに隠れて照合できない（距離が遠い）ときは、メインスキル・
+ // おてつだい時間・所持数から推定した種族を使う。食材を「推定」で埋める判断にも使うため、
+ // 確信ありにはしない。
+ if(estimate&&estimateScore>=2&&best.distance>42)return {name:estimate,confident:false};
  if(best.distance<=42)return {name:best.name,confident:false};
  return {name:'',confident:false};
 }
@@ -191,6 +205,38 @@ function reconcileFoods(foods,match){
   return '';
  });
  return {foods:next,warnings};
+}
+// 読めなかった食材を「可能性が高い」方で埋める。埋めた値は「推定」として印を付け、
+// 画像で確定した値（read）とは区別する。
+// - 種族が分かっていて、その枠の候補が1つだけ → その食材（画像が強く矛盾するときは入れない）
+// - 候補が複数 → 画像のスコアがいちばん高い候補（0.50以上）を採用
+// - 種族が分からない → 画像の1位がはっきりしている（0.68以上・2位と0.04以上）ときだけ採用
+function suggestFoods(foodList,matchList,species){
+ const mon=species.name?db.mons.find(m=>m.name===species.name):null;
+ const foods=[],origins=[];
+ for(let i=0;i<3;i++){
+  const read=foodList?.[i]||'';
+  const matches=matchList?.[i]||[];
+  const top=matches[0]||null,second=matches[1]||null;
+  const scoreOf=name=>matches.find(m=>m.name===name)?.score??0;
+  const allowed=mon?(mon.foodSlots?.[i]||mon.foods||[]):[];
+  if(read){foods.push(read);origins.push('read');continue}
+  if(allowed.length){
+   const bestAllowed=allowed.map(name=>({name,score:scoreOf(name)})).sort((left,right)=>right.score-left.score)[0];
+   if(allowed.length===1){
+    // 画像が別の食材をはっきり指しているときは入れない（画像と図鑑の食い違いを誤入力にしない）
+    const blocked=!!top&&top.name!==allowed[0]&&top.score>=0.70&&(top.score-scoreOf(allowed[0]))>=0.10;
+    if(!blocked){foods.push(allowed[0]);origins.push('estimated');continue}
+   }else if(bestAllowed.score>=0.50){
+    foods.push(bestAllowed.name);origins.push('estimated');continue
+   }
+  }
+  if(!allowed.length&&top&&top.score>=0.68&&(top.score-(second?.score??0))>=0.04){
+   foods.push(top.name);origins.push('estimated');continue
+  }
+  foods.push('');origins.push(null);
+ }
+ return {foods,origins};
 }
 function field(label,value,options,candidates){
  const wrap=document.createElement('label');wrap.append(label);
@@ -232,12 +278,18 @@ function add(file,url,match,r,id,draft={}){
  const species={name:match.name||'',confident:!!match.confident};
  const mon=db.mons.find(m=>m.name===species.name);
  const reconciled=reconcileFoods(r.foodList||[],species);
- // 未読の値は空欄のまま。種族を選んだからといってスキルや食材を埋めない。
+ // 読めなかった食材は、種族の候補と画像のスコアから「可能性が高い」値で補う。
+ // 補った値は「推定」として印を付け、画像で確定した値と区別する（手で直せば消える）。
+ const suggested=suggestFoods(reconciled.foods,r.foodCandidates,species);
  const rawVals=[fixCircleMark(r.name,match.circle,r.nameMark),species.name,r.lv,r.mainSkillLv,
-  ...Array.from({length:3},(_,i)=>reconciled.foods?.[i]),
+  ...suggested.foods,
   r.mainSkillName,r.nature,...Array.from({length:5},(_,i)=>r.subSkillList?.[i])];
  const vals=draft.vals||rawVals.map(value=>value==null?'':String(value));
- const sources=draft.sources||rawVals.map(value=>value==null||value===''?'undetermined':'read');
+ const sources=draft.sources||rawVals.map((value,index)=>{
+  const foodIndex=index-4;
+  if(foodIndex>=0&&foodIndex<3&&suggested.origins[foodIndex]==='estimated')return 'estimated';
+  return value==null||value===''?'undetermined':'read';
+ });
  const det=document.createElement('details'),summary=document.createElement('summary'),grid=document.createElement('section');
  const pic=document.createElement('details'),ps=document.createElement('summary'),img=new Image();ps.textContent='元のスクショ';if(url){img.src=url;pic.append(ps,img)}else pic.hidden=true;
  const controls=headers.map((label,i)=>{
@@ -251,8 +303,15 @@ function add(file,url,match,r,id,draft={}){
  const values=()=>controls.map(c=>c.value);
  const entry={det,controls,id,url,sha:draft.sha||'',warnings:reconciled.warnings};
  function refresh(){
-  badges.forEach((badge,index)=>{const state=sources[index];badge.hidden=!(state==='undetermined'&&!controls[index].value);badge.textContent=state==='read'?'読み取り':'未確定'});
-  summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'');
+  badges.forEach((badge,index)=>{
+   const state=sources[index];
+   // 「推定」＝可能性が高いので入れたが、画像では確定していない値（タップで直せる）。
+   if(state==='estimated'&&controls[index].value){badge.hidden=false;badge.textContent='推定';badge.classList.add('est')}
+   else if(state==='undetermined'&&!controls[index].value){badge.hidden=false;badge.textContent='未確定';badge.classList.remove('est')}
+   else badge.hidden=true;
+  });
+  const estimatedCount=sources.filter((state,index)=>state==='estimated'&&controls[index].value).length;
+  summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'')+(estimatedCount?' · 推定'+estimatedCount+'件':'');
  }
  const persist=()=>saveDraft({id,vals:values(),sources,filename:file.name,preview:draft.preview||'',sha:entry.sha,date:Date.now()});
  entry.refresh=refresh;entry.persist=persist;

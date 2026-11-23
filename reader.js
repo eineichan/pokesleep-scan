@@ -5345,7 +5345,12 @@ function splitSubSkillLine(line) {
   return segmentList.length ? segmentList : [line];
 }
 function getSkillAliasList(name) {
-  return [.../* @__PURE__ */ new Set([name, name.replace(/\(.+\)$/, "")])];
+  // 「ほっぺすりすり (げんきエールS)」のように、図鑑データ側だけ古い名前＋
+  // ゲーム内の名前がかっこで併記されている種族が57種ある。画面にはかっこの中の
+  // 名前が出るので、かっこの中も別名として照合する（トゲデマル等の取り違え対策）。
+  const inside = name.match(/\((.+)\)$/)?.[1] ?? null;
+  const outside = name.replace(/\(.+\)$/, "").trim();
+  return [.../* @__PURE__ */ new Set([name, outside, inside].filter(Boolean))];
 }
 function getSkillSimilarity(expected, actual) {
   return Math.max(...getSkillAliasList(expected).flatMap(
@@ -5553,6 +5558,8 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     helpTime: helpTimeMatch ? `${helpTimeMatch[1] ? `${Number(helpTimeMatch[1])}\u6642\u9593` : ""}${parsedMinute}\u5206${Number(helpTimeMatch[3])}\u79D2` : null,
     bag: parseBag(rawText),
     foodList: foodRecognitionList.map((food) => food.name),
+    // 食材の照合スコア（候補と点）。種族の候補食材と突き合わせて「推定で埋める」判断に使う。
+    foodCandidates: foodRecognitionList.map((food) => (food.matchList ?? []).slice(0, 5).map((match) => ({ name: match.name, score: match.score }))),
     mainSkillName: mainSkill?.match.score >= 0.65 ? mainSkill.name : null,
     mainSkillLv,
     subSkillList,
@@ -6389,7 +6396,20 @@ function findSubSkillPillRegionList(sourceCanvas, band) {
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) rowCount[y] += mask[y * width + x];
   }
-  const rowList = subSkillRunList(rowCount.map((count) => count > width * 0.02), 14).map(([start, end]) => [start + band.y0, end + band.y0]).filter(([start, end]) => end - start >= 40 && end - start <= 260);
+  // 白い（コモン）ピルは中身がほぼ白で、枠線と文字の行しか濃くならないため、
+  // 行の高さが「文字の帯」だけになる。ここで40px未満を捨てると、食材確率アップS の
+  // ように白いピルの行が丸ごと落ちる（v2.3 の未読の主因）。20pxまで拾い、あとで
+  // ピルの高さに広げる。
+  // 鍵バッジ（🔒 Lv.50）の行と、その下のピルの文字の行は20pxほどしか離れていない。
+  // そのままだと「同じ段」が2行に分かれ、行の順番（Lv10/25/50/70/80）がずれるので、
+  // 近すぎる行は同じ段としてまとめる。
+  const rawRowList = subSkillRunList(rowCount.map((count) => count > width * 0.015), 14);
+  const rowList = rawRowList.reduce((list2, [start, end]) => {
+    const previous = list2[list2.length - 1];
+    if (previous && start - previous[1] <= 32) previous[1] = end;
+    else list2.push([start, end]);
+    return list2;
+  }, []).map(([start, end]) => [start + band.y0, end + band.y0]).filter(([start, end]) => end - start >= 30 && end - start <= 300);
   // ピルが並ぶ行だけを拾う（メインスキルの枠の行は候補が0個になる）。
   const pillRowList = rowList.map(([rowStart, rowEnd]) => {
     const columnCount = new Array(width).fill(0);
@@ -6410,112 +6430,171 @@ function findSubSkillPillRegionList(sourceCanvas, band) {
       }
     }
   });
+  // 白いピルは文字の帯しか取れないので、同じ画面のピルの高さ（中央値）まで上下に広げる。
+  // 文字はピルの上下中央にあるので、中心を保ったまま広げれば文字は切れない。
+  if (regionList.length) {
+    const heightList = regionList.map((region) => region.height).toSorted((left, right) => left - right);
+    const pillHeight = Math.max(90, heightList[Math.floor(heightList.length / 2)]);
+    for (const region of regionList) {
+      if (region.height >= pillHeight * 0.8) continue;
+      const centerY = region.y + region.height / 2;
+      let top = Math.round(centerY - pillHeight / 2);
+      top = Math.max(band.y0, Math.min(top, sourceCanvas.height - pillHeight));
+      region.y = top;
+      region.height = Math.min(pillHeight, sourceCanvas.height - top);
+    }
+  }
   return regionList;
 }
 // ピルの中の文字の行（Lv.50 のような鍵バッジは避ける）を切り出し、濃淡を伸ばして拡大する。
+// v2.4: コモン（白）のサブスキルは文字が淡い灰色で、v2.3 は枠線を削るぶん文字の上下が
+// 欠けて読めていなかった。ここでは枠線ではなく「文字の帯」を探し、まわりを余白として
+// 残したまま、元画像から滑らかに拡大してから濃淡を大きく伸ばす（2値化しない）。
 function createSubSkillLineCanvas(sourceCanvas, region, option) {
-  const scale = option?.scale ?? 3;
-  const padding = option?.padding ?? 0.05;
-  const darkRate = option?.darkRate ?? 0.02;
-  const lightRate = option?.lightRate ?? 0.9;
-  const border = Math.max(3, Math.round(region.height * 0.12));
-  const width = region.width - border * 2;
-  const height = region.height - border * 2;
-  if (width < 20 || height < 16) return null;
-  const { gray } = subSkillRegionGray(sourceCanvas, region.x + border, region.y + border, width, height);
-  // ロック中のピルは淡い灰色の文字、解放済みは濃い文字。背景の明るさから閾値を決める。
-  const sortedGray = Array.from(gray).sort((left, right) => left - right);
-  const background = sortedGray[Math.floor(sortedGray.length * 0.9)] ?? 250;
-  const darkest = sortedGray[Math.floor(sortedGray.length * 0.02)] ?? 0;
-  const threshold = Math.min(242, Math.max(120, background - Math.max(14, (background - darkest) * 0.32)));
-  // 鍵バッジや枠線は濃い色が長く続く。文字の画は細いので、長い塊を文字の行から外す。
-  const blockThreshold = Math.max(70, Math.min(threshold - 20, background - 60));
-  const rowInk = new Array(height).fill(0);
-  const columnInk = new Array(width).fill(0);
-  const rowIsBlock = new Array(height).fill(false);
-  for (let y = 0; y < height; y++) {
-    let run = 0;
-    let longestRun = 0;
-    for (let x = 0; x < width; x++) {
-      const value = gray[y * width + x];
-      if (value < threshold) {
-        rowInk[y]++;
-        columnInk[x]++;
-      }
-      if (value < blockThreshold) {
-        run++;
-        if (run > longestRun) longestRun = run;
-      } else {
-        run = 0;
-      }
-    }
-    rowIsBlock[y] = longestRun >= width * 0.12;
+  const scale = option?.scale ?? 4;
+  const padY = option?.padY ?? 0.55;
+  const padX = option?.padX ?? 0.3;
+  const mode = option?.mode ?? "stretch";
+  const x = Math.max(0, Math.round(region.x));
+  const y = Math.max(0, Math.round(region.y));
+  const width = Math.min(sourceCanvas.width - x, Math.round(region.width));
+  const height = Math.min(sourceCanvas.height - y, Math.round(region.height));
+  if (width < 60 || height < 18) return null;
+  // ピルの左右の枠線は縦に長く濃いので、そのまま数えると「行の左右の端」が
+  // いつもピル幅いっぱいになり、鍵バッジと文字を区別できない。枠の内側だけを見る。
+  const insetX = Math.max(4, Math.round(width * 0.03));
+  const analysisX = x + insetX;
+  const analysisWidth = width - insetX * 2;
+  if (analysisWidth < 40) return null;
+  const { gray } = subSkillRegionGray(sourceCanvas, analysisX, y, analysisWidth, height);
+  // 文字の濃さは「このピルの地の色」からの差で見る。金・青のピルは地の色そのものが
+  // 濃いので、固定のしきい値だとピル全体が文字になってしまう。
+  // 地の色は行ごとに変わる（金のピルは下へ行くほど濃い）。行ごとの明るい側(88%)を
+  // その行の地の色とし、そこから十分暗い画素だけを文字とみなす。こうすると
+  // グラデーションや、横いっぱいのふちが「文字の帯」に化けない。
+  const textThresholdList = new Array(height).fill(0);
+  for (let row = 0; row < height; row++) {
+    const valueList = [];
+    for (let col = 0; col < analysisWidth; col += 2) valueList.push(gray[row * analysisWidth + col]);
+    valueList.sort((left, right) => left - right);
+    const rowBackground = valueList[Math.floor(valueList.length * 0.88)] ?? 255;
+    textThresholdList[row] = rowBackground - Math.max(16, rowBackground * 0.08);
   }
-  // 端から端まで埋まった行・列は枠線なので文字の行から除く。
-  const rowFlagList = rowInk.map((count, y) => count > width * 0.01 && count < width * 0.7 && !rowIsBlock[y]);
-  const columnIsText = columnInk.map((count) => count < height * 0.7);
-  const lineList = subSkillRunList(rowFlagList, 3).map(([start, end]) => {
-    const hitList = new Uint8Array(width);
+  const mask = new Uint8Array(analysisWidth * height);
+  for (let row = 0; row < height; row++) {
+    for (let col = 0; col < analysisWidth; col++) {
+      mask[row * analysisWidth + col] = gray[row * analysisWidth + col] < textThresholdList[row] ? 1 : 0;
+    }
+  }
+  const rowCount = new Array(height).fill(0);
+  for (let row = 0; row < height; row++) {
+    let count = 0;
+    for (let col = 0; col < analysisWidth; col++) count += mask[row * analysisWidth + col];
+    rowCount[row] = count;
+  }
+  // ピルの上下の枠線は横いっぱいに続く行。これを文字の行に数えると、鍵バッジの帯と
+  // くっついて「ピル幅いっぱいの帯」に見えてしまうので、枠線の行は除く。
+  const borderRowList = rowCount.map((count) => count > analysisWidth * 0.8);
+  // 文字の帯: 幅の5%以上が濃い行が10行以上続く所。枠線・影・鍵バッジの縁は数行しか続かない。
+  const runList = subSkillRunList(rowCount.map((count, row) => count > Math.max(6, analysisWidth * 0.05) && !borderRowList[row]), 3)
+    .filter(([start, end]) => end - start + 1 >= Math.max(10, height * 0.12) && end - start + 1 <= height * 0.6);
+  if (!runList.length) return null;
+  // 鍵バッジ（🔒 Lv.50）は左寄りの狭い帯なので、横にいちばん広がった帯をサブスキル名とみなす。
+  // 文字の左右の端も同時に求め、最後の S/M を切らないよう、あとで余白を足す。
+  const lineCandidateList = runList.map(([start, end]) => {
+    let left = analysisWidth;
+    let right = -1;
     let ink = 0;
-    for (let y = start; y <= end; y++) {
-      for (let x = 0; x < width; x++) {
-        if (columnIsText[x] && gray[y * width + x] < threshold) {
-          hitList[x] = 1;
-          ink++;
-        }
+    const columnInk = new Array(analysisWidth).fill(0);
+    for (let row = start; row <= end; row++) {
+      for (let col = 0; col < analysisWidth; col++) {
+        if (!mask[row * analysisWidth + col]) continue;
+        ink++;
+        columnInk[col]++;
+        if (col < left) left = col;
+        if (col > right) right = col;
       }
     }
-    return { start, end, ink, coverage: hitList.reduce((sum, value) => sum + value, 0) };
-    // 文字はピルの中央に寄る。端から端まで届く行（枠線・鍵バッジの縁）は文字の行ではない。
-  }).filter((line) => line.end - line.start >= 8 && line.coverage <= width * 0.82);
-  if (!lineList.length) return null;
-  const line = lineList.toSorted((left, right) => right.coverage - left.coverage || right.ink - left.ink)[0];
-  const lineY = Math.max(0, line.start - Math.round(height * padding));
-  const lineHeight = Math.min(height - lineY, line.end - line.start + 1 + Math.round(height * padding * 2));
-  const histogram = new Array(256).fill(0);
-  let total = 0;
-  for (let y = lineY; y < lineY + lineHeight; y++) {
-    for (let x = 0; x < width; x++) {
-      histogram[Math.min(255, Math.max(0, Math.round(gray[y * width + x])))]++;
-      total++;
+    // 「帯の高さの3割以上で濃い列」だけを文字の芯とする。鍵バッジの右側にうっすら
+    // 出る影のような数行だけの列は芯に入れない（これでバッジとピル名を区別する）。
+    const runHeight = end - start + 1;
+    let coreLeft = analysisWidth;
+    let coreRight = -1;
+    for (let col = 0; col < analysisWidth; col++) {
+      if (columnInk[col] < runHeight * 0.3) continue;
+      if (col < coreLeft) coreLeft = col;
+      if (col > coreRight) coreRight = col;
     }
-  }
-  let accumulated = 0;
-  let dark = 0;
-  let light = 255;
-  for (let value = 0; value < 256; value++) {
-    accumulated += histogram[value];
-    if (accumulated >= total * darkRate) {
-      dark = value;
-      break;
-    }
-  }
-  accumulated = 0;
-  for (let value = 0; value < 256; value++) {
-    accumulated += histogram[value];
-    if (accumulated >= total * lightRate) {
-      light = value;
-      break;
-    }
-  }
-  const span = Math.max(20, light - dark);
-  const canvas = createCanvas(Math.round(width * scale), Math.round(lineHeight * scale));
+    return { start, end, left, right, ink, extent: right - left + 1, coreLeft, coreRight, coreExtent: coreRight - coreLeft + 1 };
+  }).filter((candidate) => candidate.right > candidate.left && candidate.coreExtent >= analysisWidth * 0.3);
+  if (!lineCandidateList.length) return null;
+  const line = lineCandidateList.toSorted((leftValue, rightValue) => rightValue.coreExtent - leftValue.coreExtent || rightValue.ink - leftValue.ink)[0];
+  const lineHeight = line.end - line.start + 1;
+  const padYPixel = Math.round(lineHeight * padY);
+  const padXPixel = Math.round(lineHeight * padX);
+  const cropX = Math.max(0, analysisX + line.left - padXPixel);
+  const cropY = Math.max(0, y + line.start - padYPixel);
+  const cropRight = Math.min(sourceCanvas.width - 1, analysisX + line.right + padXPixel);
+  const cropBottom = Math.min(sourceCanvas.height - 1, y + line.end + padYPixel);
+  const cropWidth = cropRight - cropX + 1;
+  const cropHeight = cropBottom - cropY + 1;
+  const canvas = createCanvas(Math.round(cropWidth * scale), Math.round(cropHeight * scale));
   const context = canvas.getContext("2d", { willReadFrequently: true });
-  const imageData = context.createImageData(canvas.width, canvas.height);
-  for (let y = 0; y < canvas.height; y++) {
-    for (let x = 0; x < canvas.width; x++) {
-      const sourceX = Math.min(width - 1, Math.floor(x / scale));
-      const sourceY = Math.min(lineHeight - 1, Math.floor(y / scale));
-      const value = (gray[(lineY + sourceY) * width + sourceX] - dark) / span < 0.5 ? 0 : 255;
-      const pixelIndex = (y * canvas.width + x) * 4;
-      imageData.data[pixelIndex] = value;
-      imageData.data[pixelIndex + 1] = value;
-      imageData.data[pixelIndex + 2] = value;
-      imageData.data[pixelIndex + 3] = 255;
-    }
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(sourceCanvas, cropX, cropY, cropWidth, cropHeight, 0, 0, canvas.width, canvas.height);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const { data } = imageData;
+  const luminance = new Float32Array(canvas.width * canvas.height);
+  for (let index = 0; index < luminance.length; index++) {
+    luminance[index] = data[index * 4] * 0.299 + data[index * 4 + 1] * 0.587 + data[index * 4 + 2] * 0.114;
+  }
+  // 濃淡の引き伸ばし: 文字の濃い側(3%)〜背景(88%)を 0〜255 に広げる
+  const sorted = Array.from(luminance).sort((leftValue, rightValue) => leftValue - rightValue);
+  const dark = sorted[Math.floor(sorted.length * 0.03)] ?? 0;
+  const light = sorted[Math.floor(sorted.length * 0.88)] ?? 255;
+  const span = Math.max(24, light - dark);
+  for (let index = 0; index < luminance.length; index++) {
+    const ratio = Math.max(0, Math.min(1, (luminance[index] - dark) / span));
+    const value = mode === "binary" ? (ratio < 0.5 ? 0 : 255) : Math.round((1 - Math.pow(ratio, 0.85)) * 255);
+    data[index * 4] = value;
+    data[index * 4 + 1] = value;
+    data[index * 4 + 2] = value;
+    data[index * 4 + 3] = 255;
   }
   context.putImageData(imageData, 0, 0);
   return canvas;
+}
+// ピルの色（金・青・白）はサブスキルのレア度に対応している。
+// 白=コモン(S系)、青=アンコモン(M/L系)、金=レア(ボーナス系)。S と M の読み分けに使う。
+// 地の色はほぼ白なので、ふちの色を数える。鍵バッジの茶色は金に数えられやすいため、
+// 「ピル全体の8%以上」を条件にして、細いバッジだけでは色を決めない。
+function subSkillPillRarity(sourceCanvas, region) {
+  const x = Math.max(0, Math.round(region.x));
+  const y = Math.max(0, Math.round(region.y));
+  const width = Math.min(sourceCanvas.width - x, Math.round(region.width));
+  const height = Math.min(sourceCanvas.height - y, Math.round(region.height));
+  if (width < 20 || height < 10) return null;
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const { data } = context.getImageData(x, y, width, height);
+  let goldCount = 0;
+  let blueCount = 0;
+  let sampleCount = 0;
+  for (let index = 0; index < width * height; index++) {
+    const red = data[index * 4];
+    const green = data[index * 4 + 1];
+    const blue = data[index * 4 + 2];
+    const luminance = red * 0.299 + green * 0.587 + blue * 0.114;
+    if (luminance < 140) continue; // 文字は除く
+    sampleCount++;
+    if (red - blue >= 12 && green - blue >= 6) goldCount++;
+    else if (blue - red >= 12) blueCount++;
+  }
+  if (!sampleCount) return null;
+  const minimum = sampleCount * 0.08;
+  if (goldCount > blueCount && goldCount >= minimum) return 3;
+  if (blueCount > goldCount && blueCount >= minimum) return 2;
+  return 1;
 }
 // 漢字は1画ちがいで別の字に読めやすい（材/林、率/奉、持/待…）。文字の並び（2文字組）の
 // 一致と編集距離を合わせて見て、1〜2文字化けても正しいサブスキルに寄せる。
@@ -6538,19 +6617,35 @@ function getSubSkillSimilarity(expected, actual) {
   const bigramScore = getCharacterBigramRecall(expected, actual);
   return editScore * 0.55 + bigramScore * 0.45;
 }
-function selectSubSkillName(recognizedText) {
+function scoreSubSkillNameList(recognizedText, filter) {
+  const cleaned = normalizeText(recognizedText).replace(/Lv\.?[0-9]+/gi, "");
+  if (!cleaned) return [];
+  return sub_skill_default.list
+    .filter(filter ?? (() => true))
+    .map((subSkill) => ({
+      name: subSkill.name,
+      rarity: subSkill.rarity,
+      score: Math.max(getTextSimilarity(subSkill.name, cleaned), getSubSkillSimilarity(subSkill.name, cleaned))
+    }))
+    .toSorted((left, right) => right.score - left.score);
+}
+function selectSubSkillName(recognizedText, rarityHint) {
   const cleaned = normalizeText(recognizedText).replace(/Lv\.?[0-9]+/gi, "");
   if (!cleaned) return null;
-  // 「M」「L」の読み分けは最後の1文字に頼りやすいので、末尾の記号が読めている間はその大きさだけを候補にする。
+  // 「M」「L」の読み分けは最後の1文字に頼りやすいので、末尾の記号が読めている間はその大きさを優先する。
   const sizeMatch = cleaned.match(/([SML])$/);
-  const sizeFilteredList = sizeMatch ? sub_skill_default.list.filter((subSkill) => subSkill.name.endsWith(sizeMatch[1])) : [];
-  const candidateList = sizeFilteredList.length ? sizeFilteredList : sub_skill_default.list;
-  const scoreList = candidateList.map((subSkill) => ({
-    name: subSkill.name,
-    score: Math.max(getTextSimilarity(subSkill.name, cleaned), getSubSkillSimilarity(subSkill.name, cleaned))
-  })).toSorted((left, right) => right.score - left.score);
+  let scoreList = sizeMatch ? scoreSubSkillNameList(recognizedText, (subSkill) => subSkill.name.endsWith(sizeMatch[1])) : [];
+  if (!scoreList.length) scoreList = scoreSubSkillNameList(recognizedText);
   const [best, second] = scoreList;
   if (!best || best.score < 0.5) return null;
+  // ピルの色（白=コモン/青=アンコモン/金=レア）と読んだ大きさが食い違うときは、
+  // 同じ系統の別サイズ（S/M/L）と比べ、文字も十分近ければ色に合う方を採る。
+  // 例: 白いピルの「食材確率アップS」を「M」と読み違えた場合の取り違えを防ぐ。
+  if (rarityHint && best.rarity !== rarityHint) {
+    const family = best.name.slice(0, -1);
+    const variant = scoreSubSkillNameList(recognizedText).find((item) => item.name.slice(0, -1) === family && item.rarity === rarityHint);
+    if (variant && variant.score >= best.score - 0.12) return variant.name;
+  }
   // 1位と2位が僅差のときは読み取りが足りていないので、確信を持てるまで返さない。
   if (second && best.score < 0.62 && best.score - second.score < 0.06) return null;
   return best.name;
@@ -6568,21 +6663,29 @@ async function recognizeSubSkillNameList(sourceCanvas, worker) {
     for (const region of regionList) {
       const slot = region.slot ?? slotNameList.findIndex((name) => name == null);
       if (slot < 0 || slot >= 5 || slotNameList[slot] != null) continue;
+      // ピルの色はレア度（白=S系/青=M系/金=ボーナス系）の手がかり。S と M の読み分けに使う。
+      const rarity = subSkillPillRarity(sourceCanvas, region);
       const optionList = [
-        { scale: 3, padding: 0.05, darkRate: 0.02, lightRate: 0.9 },
-        { scale: 4, padding: 0.08, darkRate: 0.01, lightRate: 0.85 },
-        { scale: 3, padding: 0.1, darkRate: 0.06, lightRate: 0.75 }
+        { scale: 4, mode: "stretch", padY: 0.55, padX: 0.3 },
+        { scale: 3, mode: "stretch", padY: 0.7, padX: 0.35 },
+        { scale: 4, mode: "binary", padY: 0.5, padX: 0.3 }
       ];
-      let name = null;
+      let best = null;
       for (const option of optionList) {
         const canvas = createSubSkillLineCanvas(sourceCanvas, region, option);
         if (!canvas) continue;
         const result = await worker.recognize(canvas, {}, { text: true });
-        name = selectSubSkillName(result.data.text);
-        if (name) break;
+        const name = selectSubSkillName(result.data.text, rarity);
+        if (!name) continue;
+        const cleaned = normalizeText(result.data.text).replace(/Lv\.?[0-9]+/gi, "");
+        const score = Math.max(getTextSimilarity(name, cleaned), getSubSkillSimilarity(name, cleaned));
+        // 読み取り方は1つに決め打たず、いちばん文字に近い結果を採る。
+        if (!best || score > best.score) best = { name, score };
+        // 十分にきれいに読めたら、残りの読み方は試さない（1枚あたりの時間を抑える）。
+        if (best.score >= 0.9) break;
       }
       // 同じサブスキルが2つ並ぶことはないので、既に読めた名前は別の枠へ回さない。
-      if (name && !slotNameList.includes(name)) slotNameList[slot] = name;
+      if (best && !slotNameList.includes(best.name)) slotNameList[slot] = best.name;
     }
   } finally {
     await worker.setParameters({
@@ -6935,6 +7038,29 @@ ${outlinedRegionResult?.data.text ?? ""}`;
     this.#worker = null;
   }
 };
+// 診断用: ?debug=1 のときだけ内部の関数を公開する（開発時の切り分け用）
+if (typeof window !== "undefined" && /(^|[?&])debug=1(&|$)/.test(location.search)) {
+  window.__pkInternals = {
+    createCanvas,
+    drawImageToCanvas,
+    findSubSkillBand,
+    findSubSkillPillRegionList,
+    createSubSkillLineCanvas,
+    selectSubSkillName,
+    subSkillPillRarity,
+    subSkillRegionGray,
+    recognizeSubSkillNameList,
+    recognizeFoodList,
+    matchFoodSlot,
+    foodSlotBoxes,
+    foodCreamColor,
+    foodTemplateList,
+    isAllowedFood,
+    pokemon_default,
+    Food,
+    sub_skill_default
+  };
+}
 export {
   PokemonStatusImageReader as default
 };
