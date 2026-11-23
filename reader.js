@@ -5210,7 +5210,9 @@ async function loadImage(source) {
   return image;
 }
 function drawImageToCanvas(image, sourceWidth, sourceHeight) {
-  const scale = OCR_IMAGE_WIDTH / sourceWidth;
+  // 端末のスクショは 1080px を超えることが多い。読み取り前に縮小すると小さな記号や
+  // 薄い文字が潰れるので、元の解像度を下回らないようにする（拡大のみ）。
+  const scale = Math.max(1, OCR_IMAGE_WIDTH / sourceWidth);
   const canvas = createCanvas(Math.round(sourceWidth * scale), Math.round(sourceHeight * scale));
   const context = canvas.getContext("2d", { willReadFrequently: true });
   context.drawImage(image, 0, 0, canvas.width, canvas.height);
@@ -5470,55 +5472,37 @@ function estimatePokemon(result, foodRecognitionList) {
   return hasEnoughDifference ? best.pokemon : null;
 }
 function correctResult(result, foodRecognitionList, iconName) {
+  // 種族は「どの個体か」の手がかりとして返すだけで、読めなかった項目を種族の
+  // データで埋めたり、読めた数字を別の値へ置き換えたりはしない。
+  // （名前の表記揺れ・レベルの丸め・食材の補完は v2.1 までの挙動で、誤確定の元だった）
   const pokemon = pokemon_default.map[iconName ?? ""] ?? estimatePokemon(result, foodRecognitionList);
   if (!pokemon) return result;
-  const actualHelpTime = parseHelpTime(result.helpTime);
-  const correctedLv = correctLevel(pokemon, result.lv, actualHelpTime, result.subSkillList, result.nature);
-  const correctedSubSkillList = correctBagSubSkillList(pokemon, correctedLv, result.bag, result.subSkillList);
-  const correctedHelpTime = getNearestNumber(
-    actualHelpTime,
-    getExpectedHelpTimeList(pokemon, correctedLv, correctedSubSkillList, result.nature)
-  );
-  const correctedBag = getNearestNumber(
-    result.bag,
-    getExpectedBagList(pokemon, correctedLv, correctedSubSkillList)
-  );
-  const correctedMainSkillName = getSkillAliasList(pokemon.skill.name).toSorted(
-    (left, right) => getTextSimilarity(right, result.mainSkillName ?? "") - getTextSimilarity(left, result.mainSkillName ?? "")
-  )[0];
-  const correctedFoodList = Array.from({ length: 3 }, (_, slotIndex) => {
-    const recognizedFood = result.foodList[slotIndex];
-    const recognition = foodRecognitionList[slotIndex];
-    if (recognition?.empty) return null;
-    if (slotIndex == 0 && pokemon.foodNameList.length > 3) return pokemon.foodNameList[0] ?? null;
-    if (slotIndex == 0 && recognition?.region.occluded) return pokemon.foodNameList[0] ?? null;
-    const recognizedNumMatched = recognition?.num == null || pokemon.foodNumListMap[recognizedFood ?? ""]?.[slotIndex] == recognition.num;
-    if (recognizedFood && isAllowedFood(pokemon, recognizedFood, slotIndex) && recognizedNumMatched) {
-      return recognizedFood;
-    }
-    const allowedMatch = getAllowedFoodMatch(pokemon, recognition, slotIndex);
-    return allowedMatch?.name ?? (slotIndex == 0 ? pokemon.foodNameList[0] : null);
-  });
   return {
     ...result,
-    // 種族名に十分近い場合だけ表記揺れを直し、ニックネームはそのまま保持する。
-    name: result.name && getTextSimilarity(pokemon.name, result.name) >= 0.65 ? pokemon.name : result.name,
+    name: result.name,
+    lv: result.lv,
     pokemonName: pokemon.name,
-    lv: correctedLv,
-    // 画面から時間を直接読めた場合は、睡眠リボン等の画像にない条件から逆算した値で上書きしない。
-    helpTime: actualHelpTime != null ? result.helpTime : correctedHelpTime == null ? null : formatHelpTime(correctedHelpTime),
-    bag: correctedBag ?? result.bag,
-    foodList: correctedFoodList,
-    subSkillList: correctedSubSkillList,
-    // 「(ランダム)」等が画面で省略される場合は、認識した表示に近い別名を返す。
-    mainSkillName: correctedMainSkillName
+    foodList: result.foodList.map((food) => food ?? null),
+    subSkillList: result.subSkillList,
+    mainSkillName: result.mainSkillName,
+    warnings: result.warnings ?? []
   };
 }
-function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList, subSkillPillNameList = null) {
+function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList, subSkillPillNameList = null, nameCard = null, levelArea = null, nameFix = null) {
   const normalizedRawText = normalizeText(rawText);
-  const levelLineList = primaryLineList.map((line) => ({ line, match: normalizeText(line.text).match(/Lv\.?([0-9]{1,3})(.*)/i) })).filter((item) => item.match != null).toSorted((a, b) => a.line.y0 - b.line.y0);
-  const pokemonLevelLine = levelLineList[0];
-  const lv = pokemonLevelLine ? Number(pokemonLevelLine.match[1]) : null;
+  // 個体レベルは名前パネルの中の「Lv.NN」だけ。サブスキルの解放レベル（Lv.50 など）や
+  // 食材の Lv.30/60 を拾わないよう、読む範囲を名前パネルの帯に限る。
+  // OCRは「Lv.14」を「Lvy.14」「Lvi4」のように崩すことがある。Lv の直後の数文字は
+  // 数字以外でも許して、数字とその後の名前を拾う。
+  const allLevelLineList = primaryLineList.map((line) => ({ line, match: normalizeText(line.text).match(/Lv[^0-9]{0,3}([0-9]{1,3})(.*)/i) }))
+    .filter((item) => item.match != null)
+    .toSorted((a, b) => a.line.y0 - b.line.y0);
+  const levelLineList = allLevelLineList.filter((item) => !levelArea || (item.line.y0 >= levelArea.y0 && item.line.y0 <= levelArea.y1));
+  // 名前に続く「Lv.NN」を優先する（食材のLv.30/60やサブスキルのLv.50は名前が続かない）。
+  const namedLevelLineList = levelLineList.filter((item) => (item.match?.[2] ?? "").replace(/^[\s:：.．・･_\-]+/, "").trim().length > 0);
+  const pokemonLevelLine = namedLevelLineList[0] ?? levelLineList[0];
+  // 名前パネルから読めた値を最優先する。読めないときだけ全体OCRの行から拾う。
+  const lv = nameCard?.lv ?? (pokemonLevelLine ? Number(pokemonLevelLine.match[1]) : null);
   const parsedName = pokemonLevelLine?.match[2].replace(/^[.:・\-]+/, "").trim() ?? "";
   const helpTimeMatch = normalizedRawText.match(/(?:(\d+)時間)?(\d+)分(\d+)秒/);
   const parsedMinute = helpTimeMatch ? Number(helpTimeMatch[2]) >= 60 && !helpTimeMatch[1] ? Number(helpTimeMatch[2].slice(-2)) : Number(helpTimeMatch[2]) : null;
@@ -5527,9 +5511,13 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     match: findBestLine(alias, lineList)
   }))).toSorted((left, right) => right.match.score - left.match.score)[0];
   const primaryMainSkillLine = mainSkill ? getSkillAliasList(mainSkill.name).map((alias) => findBestLine(alias, primaryLineList)).toSorted((left, right) => right.score - left.score)[0] : null;
-  const mainSkillLv = levelLineList.filter(
-    (item) => item.line.y0 > (primaryMainSkillLine?.line?.y0 ?? pokemonLevelLine?.line.y0 ?? -1) && Number(item.match[1]) <= 7
-  ).map((item) => Number(item.match[1]))[0] ?? null;
+  // スキルレベルはメインスキル名と同じ行の右側にある「Lv.N」。サブスキルのLvと取り違えないよう、
+  // 名前の行と同じ高さにあるものだけを見る。
+  const mainSkillRow = primaryMainSkillLine?.line;
+  const mainSkillLv = mainSkillRow
+    ? allLevelLineList.filter((item) => Math.abs(item.line.y0 - mainSkillRow.y0) <= Math.max(12, (mainSkillRow.y1 - mainSkillRow.y0) * 1.6) && Number(item.match[1]) <= 7)
+      .map((item) => Number(item.match[1]))[0] ?? null
+    : allLevelLineList.filter((item) => item.line.y0 > (pokemonLevelLine?.line.y0 ?? -1) && Number(item.match[1]) <= 7).map((item) => Number(item.match[1]))[0] ?? null;
   const primaryDetailStatusLine = findBestLine("\u8A73\u7D30\u30B9\u30C6\u30FC\u30BF\u30B9", sourceCoordinateLineList);
   const subSkillLineList = sourceCoordinateLineList.filter(
     (line) => line.y0 > (primaryMainSkillLine?.line?.y0 ?? pokemonLevelLine?.line.y0 ?? -1) && (primaryDetailStatusLine?.score < 0.45 || line.y0 < primaryDetailStatusLine.line.y0)
@@ -5544,14 +5532,22 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     const lineHeight = Math.max(a.line.y1 - a.line.y0, b.line.y1 - b.line.y0);
     return Math.abs(a.line.y0 - b.line.y0) <= lineHeight ? a.line.x0 - b.line.x0 : a.line.y0 - b.line.y0;
   }).map((item) => item.name);
-  // ピル単位で読み取れたサブスキルは解放レベルごとの位置に並ぶので、行OCRの推定より優先する。
-  // 3つ未満しか読めないとき（縮小された画像など）は従来の行OCRの結果を使う。
+  // ピル（枠）単位で読み取れたサブスキルは、解放レベルごとの位置に固定される。
+  // 1枠読めなくても他の枠はずらさず、その枠だけを未確定にする。
   const pillNameList = (subSkillPillNameList ?? []).slice(0, 5);
   const pillCount = pillNameList.filter((name) => name != null).length;
-  const subSkillList = pillCount >= 3 ? pillNameList : subSkillLineNameList;
+  const subSkillList = pillCount >= 1 ? pillNameList : subSkillLineNameList;
   const nature = nature_default.list.map((item) => ({ name: item.name, match: findBestLine(item.name, lineList) })).toSorted((a, b) => b.match.score - a.match.score)[0];
+  // 字形の数よりOCRの文字が多いときは、末尾の記号の手前に入った余分なひらがなを削る。
+  let fixedName = parsedName;
+  if (nameFix) {
+    fixedName = fixedName.replace(/[@＠©ⓒ〇○◯◎]+$/g, "");
+    const extra = fixedName.length - nameFix.glyphCount;
+    if (extra > 0 && extra <= 2 && /^[\u3041-\u309F]+$/.test(fixedName.slice(-extra))) fixedName = fixedName.slice(0, -extra);
+  }
   const result = {
-    name: parsedName || null,
+    name: fixedName || null,
+    nameMark: nameFix?.mark ?? null,
     pokemonName: null,
     lv,
     helpTime: helpTimeMatch ? `${helpTimeMatch[1] ? `${Number(helpTimeMatch[1])}\u6642\u9593` : ""}${parsedMinute}\u5206${Number(helpTimeMatch[3])}\u79D2` : null,
@@ -5909,6 +5905,74 @@ function getPixelSimilarity(source, template) {
 function cosineSimilarity(left, right) {
   return left.reduce((sum, value, index) => sum + value * right[index], 0);
 }
+
+// 淡い円の色（領域内で最も多い色）を背景として、薄く描かれた食材を元の濃さに戻して比べる。
+// 未解放の食材は薄く描かれるため、そのままだと淡い色の食材（マメミート等）に寄りやすい。
+function findFoodCircleBackground(sourceCanvas, region) {
+  const x0 = Math.max(0, Math.round(region.x));
+  const y0 = Math.max(0, Math.round(region.y));
+  const width = Math.max(1, Math.min(sourceCanvas.width - x0, Math.round(region.width)));
+  const height = Math.max(1, Math.min(sourceCanvas.height - y0, Math.round(region.height)));
+  const { data } = sourceCanvas.getContext("2d", { willReadFrequently: true }).getImageData(x0, y0, width, height);
+  const bins = new Map();
+  for (let index = 0; index < data.length; index += 4) {
+    const key = (data[index] >> 2) << 12 | (data[index + 1] >> 2) << 6 | data[index + 2] >> 2;
+    bins.set(key, (bins.get(key) ?? 0) + 1);
+  }
+  let bestKey = 0;
+  let bestCount = -1;
+  for (const [key, count] of bins) if (count > bestCount) { bestCount = count; bestKey = key; }
+  const background = [((bestKey >> 12) & 63) * 4 + 2, ((bestKey >> 6) & 63) * 4 + 2, (bestKey & 63) * 4 + 2];
+  let minX = width;
+  let maxX = -1;
+  let minY = height;
+  let maxY = -1;
+  let count = 0;
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+    const index = (y * width + x) * 4;
+    const distance = Math.max(
+      Math.abs(data[index] - background[0]),
+      Math.abs(data[index + 1] - background[1]),
+      Math.abs(data[index + 2] - background[2])
+    );
+    if (distance > 22) {
+      count++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (count < 60 || maxX < 0) return null;
+  const side = Math.max(maxX - minX, maxY - minY) * 1.08;
+  return {
+    background,
+    region: {
+      x: (minX + maxX) / 2 + x0 - side / 2,
+      y: (minY + maxY) / 2 + y0 - side / 2,
+      width: side,
+      height: side
+    }
+  };
+}
+function createUnblendedFoodCanvas(sourceCanvas, region, background, alpha) {
+  const side = Math.round(Math.max(region.width, region.height));
+  if (side < 12) return null;
+  const canvas = createCanvas(side, side);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.drawImage(sourceCanvas, region.x, region.y, region.width, region.height, 0, 0, side, side);
+  const imageData = context.getImageData(0, 0, side, side);
+  const { data } = imageData;
+  for (let index = 0; index < data.length; index += 4) {
+    for (let channel = 0; channel < 3; channel++) {
+      const value = (data[index + channel] - (1 - alpha) * background[channel]) / alpha;
+      data[index + channel] = Math.max(0, Math.min(255, Math.round(value)));
+    }
+    data[index + 3] = 255;
+  }
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+}
 async function recognizeFoodList(sourceCanvas) {
   const slotList = selectFoodSlotRegions(findFoodCircleRegions(sourceCanvas));
   if (!slotList.length) return [];
@@ -5938,6 +6002,23 @@ async function recognizeFoodList(sourceCanvas) {
         score: region.occluded ? pixelScore : template.name == "\u3068\u304F\u305B\u3093\u30A8\u30C3\u30B0" ? Math.max(histogramScore * 0.35 + pixelScore * 0.65, histogramScore * 0.1 + pixelScore * 0.9) + 0.01 + (sourceChroma < 0.18 ? 0.08 : 0) : histogramScore * 0.35 + pixelScore * 0.65
       };
     }).toSorted((a, b) => b.score - a.score);
+    // 2つ目の見方: 淡い円を背景として濃さを戻した画像でも照合する。
+    const circleScores = new Map();
+    const circleInfo = findFoodCircleBackground(sourceCanvas, region);
+    if (circleInfo) {
+      for (const alpha of [0.25, 0.35, 0.45, 0.6]) {
+        const canvas = createUnblendedFoodCanvas(sourceCanvas, circleInfo.region, circleInfo.background, alpha);
+        if (!canvas) continue;
+        const circleHistogram = createColorHistogram(canvas);
+        const circlePixels = createNormalizedPixels(canvas);
+        for (const template of templateList) {
+          const score = cosineSimilarity(circleHistogram, template.histogram) * 0.35 + getPixelSimilarity(circlePixels, template.pixels) * 0.65;
+          const previous = circleScores.get(template.name);
+          if (!previous || score > previous) circleScores.set(template.name, score);
+        }
+      }
+    }
+    const circleMatchList = [...circleScores.entries()].map(([name, score]) => ({ name, score })).toSorted((a, b) => b.score - a.score);
     const bestMatch = matchList[0];
     const normalizedSide = Math.sqrt(pixels.length);
     const centerPixels = pixels.filter((_, index) => {
@@ -5951,12 +6032,43 @@ async function recognizeFoodList(sourceCanvas) {
     ).length / centerPixels.length;
     const empty = !region.occluded && (foregroundRate < 0.02 || coloredForegroundRate < 0.12);
     const minimumScore = region.occluded ? 0.15 : 0.3;
+    // 2通りの見方（そのまま／濃さを戻す）が一致したときだけ採用する。
+    // 一致しないときは未確定にし、誤った値を入れない。
+    const baseSecond = matchList[1];
+    const baseGap = baseSecond ? bestMatch.score - baseSecond.score : 1;
+    const circleBest = circleMatchList[0];
+    const circleSecond = circleMatchList[1];
+    const circleGap = circleBest && circleSecond ? circleBest.score - circleSecond.score : 0;
+    const near = (list2, name) => (list2 ?? []).slice(0, 3).some((match) => match.name == name && match.score >= 0.5);
+    let accepted = false;
+    let reason = "no-match";
+    if (!empty && bestMatch && bestMatch.score >= minimumScore) {
+      if (circleBest && circleBest.name == bestMatch.name && bestMatch.score >= 0.55) {
+        accepted = true;
+        reason = "agree";
+      } else if (baseGap >= 0.06 && near(circleMatchList, bestMatch.name)) {
+        accepted = true;
+        reason = "clear-winner";
+      } else if (circleBest && circleBest.score >= 0.55 && circleGap >= 0.04) {
+        accepted = true;
+        bestMatch.name = circleBest.name;
+        bestMatch.score = circleBest.score;
+        reason = "clear-winner-unblended";
+      }
+    }
     return {
-      name: !empty && bestMatch && bestMatch.score >= minimumScore ? bestMatch.name : null,
+      name: accepted ? bestMatch.name : null,
       num: null,
       region,
-      matchList,
-      empty
+      matchList: accepted ? matchList : [...matchList, ...circleMatchList.filter((match) => !matchList.some((item) => item.name == match.name))].toSorted((a, b) => b.score - a.score),
+      empty,
+      reason,
+      rejected: !accepted && !empty ? {
+        best: matchList[0]?.name ?? null,
+        score: Math.round((matchList[0]?.score ?? 0) * 1000) / 1000,
+        gap: Math.round(baseGap * 1000) / 1000,
+        unblended: circleBest ? [circleBest.name, Math.round(circleBest.score * 1000) / 1000, Math.round(circleGap * 1000) / 1000] : null
+      } : null
     };
   });
 }
@@ -6247,8 +6359,183 @@ async function recognizeSubSkillNameList(sourceCanvas, worker) {
   return slotNameList;
 }
 
+
+// ===== 名前パネル（固定カード）の読み取り =====================================
+// ニックネームと個体レベルは、赤い縁の白いカードの中だけから読む。
+// 時計・SP・食材のLv30/60・サブスキルの解放レベルが同じ行に混ざらないようにする。
+function findNameCardBox(sourceCanvas) {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const { data } = context.getImageData(0, 0, width, height);
+  const isCardEdge = (index) => {
+    const red = data[index * 4];
+    const green = data[index * 4 + 1];
+    const blue = data[index * 4 + 2];
+    return red >= 180 && red - green >= 35 && red - blue >= 45 && blue <= 170;
+  };
+  const rowList = [];
+  for (let y = 0; y < height; y++) {
+    let first = -1;
+    let last = -1;
+    let count = 0;
+    for (let x = 0; x < width; x++) {
+      if (isCardEdge(y * width + x)) {
+        count++;
+        if (first < 0) first = x;
+        last = x;
+      }
+    }
+    if (count >= width * 0.3 && last - first >= width * 0.3) rowList.push({ y, first, last });
+  }
+  if (!rowList.length) return null;
+  const top = rowList.find((row) => row.y < height * 0.5) ?? rowList[0];
+  const maxHeight = Math.round(height * 0.16);
+  const minGap = Math.max(18, Math.round(height * 0.02));
+  const bottom = rowList.find((row) => row.y > top.y + minGap && row.y - top.y <= maxHeight);
+  const left = Math.max(0, top.first);
+  const right = Math.min(width, top.last);
+  const cardHeight = bottom ? bottom.y - top.y : Math.round(height * 0.075);
+  if (cardHeight < 30 || right - left < width * 0.25) return null;
+  return { x: left, y: top.y, width: right - left, height: cardHeight };
+}
+function createCardTextCanvas(sourceCanvas, card) {
+  // 左側はアイコンなので、文字が並ぶ右側だけを切り出す。
+  const left = card.x + Math.round(card.height * 1.05);
+  const top = card.y + Math.round(card.height * 0.06);
+  const width = Math.min(sourceCanvas.width - left - 2, card.width - Math.round(card.height * 1.05));
+  const height = Math.max(12, card.height - Math.round(card.height * 0.12));
+  if (width < 40 || height < 20) return null;
+  const scale = 4;
+  const canvas = createCanvas(Math.round(width * scale), Math.round(height * scale));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(sourceCanvas, left, top, width, height, 0, 0, canvas.width, canvas.height);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const { data } = imageData;
+  for (let index = 0; index < data.length; index += 4) {
+    const brightness = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+    const value = brightness < 150 ? 0 : 255;
+    data[index] = value;
+    data[index + 1] = value;
+    data[index + 2] = value;
+    data[index + 3] = 255;
+  }
+  context.putImageData(imageData, 0, 0);
+  return { canvas, region: { x: left, y: top, width, height }, data, width: canvas.width, height: canvas.height };
+}
+// 行（横書きの文字列）を、インクのある行の連続で分ける。
+function cardLineRunList(data, width, height) {
+  const rowInk = new Array(height).fill(0);
+  for (let y = 0; y < height; y++) {
+    let count = 0;
+    for (let x = 0; x < width; x++) if (data[(y * width + x) * 4] < 128) count++;
+    rowInk[y] = count;
+  }
+  const lineList = [];
+  let start = -1;
+  for (let y = 0; y < height; y++) {
+    const hasInk = rowInk[y] > Math.max(1, width * 0.005);
+    if (hasInk && start < 0) start = y;
+    if ((!hasInk || y === height - 1) && start >= 0) {
+      const end = hasInk ? y : y - 1;
+      if (end - start >= height * 0.05) lineList.push({ y0: start, y1: end });
+      start = -1;
+    }
+  }
+  return lineList;
+}
+// 行の中の文字（横方向にかたまりが続く範囲）を、字間で分ける。
+function cardGlyphRunList(data, width, y0, y1) {
+  const columnInk = new Array(width).fill(0);
+  for (let y = y0; y <= y1; y++) for (let x = 0; x < width; x++) if (data[(y * width + x) * 4] < 128) columnInk[x]++;
+  const gapLimit = Math.max(2, Math.round((y1 - y0) * 0.12));
+  const runList = [];
+  let start = -1;
+  let last = -1;
+  for (let x = 0; x < width; x++) {
+    if (columnInk[x] > 0) {
+      if (start < 0) start = x;
+      last = x;
+    } else if (start >= 0 && x - last > gapLimit) {
+      runList.push({ x0: start, x1: last });
+      start = -1;
+    }
+  }
+  if (start >= 0) runList.push({ x0: start, x1: last });
+  return runList;
+}
+// 末尾の記号が「丸（○／◎）」かどうかを字形から判定する。判定できなければ null。
+// ・枠いっぱいのほぼ正方形
+// ・中心が白く、その白い穴が外につながっていない（閉じた輪）
+// ・中心の横一列を横切るインクの本数（2本＝○、4本＝◎）
+function classifyCircleGlyph(data, width, run, y0, y1) {
+  const boxWidth = run.x1 - run.x0 + 1;
+  const boxHeight = y1 - y0 + 1;
+  if (boxWidth < 8 || boxHeight < 8) return null;
+  if (boxWidth < boxHeight * 0.75 || boxWidth > boxHeight * 1.05) return null;
+  const ink = (x, y) => x >= 0 && y >= 0 && x < width && data[(y * width + x) * 4] < 128;
+  const centerX = Math.round((run.x0 + run.x1) / 2);
+  const centerY = Math.round((y0 + y1) / 2);
+  if (ink(centerX, centerY)) return null;
+  // 中心の白から塗りつぶしを広げ、枠の外まで漏れたら「穴」ではない
+  const seen = new Uint8Array(boxWidth * boxHeight);
+  const queue = [[centerX - run.x0, centerY - y0]];
+  let escaped = false;
+  let holeSize = 0;
+  while (queue.length) {
+    const [x, y] = queue.pop();
+    if (x < 0 || y < 0 || x >= boxWidth || y >= boxHeight) continue;
+    const index = y * boxWidth + x;
+    if (seen[index]) continue;
+    if (ink(run.x0 + x, y0 + y)) continue;
+    seen[index] = 1;
+    holeSize++;
+    if (x === 0 || y === 0 || x === boxWidth - 1 || y === boxHeight - 1) escaped = true;
+    queue.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  if (escaped) return null;
+  const holeRate = holeSize / (boxWidth * boxHeight);
+  if (holeRate < 0.02 || holeRate > 0.4) return null;
+  const inkRunCount = (fixed, horizontal) => {
+    let runs = 0;
+    let previous = false;
+    const from = horizontal ? run.x0 : y0;
+    const to = horizontal ? run.x1 : y1;
+    for (let i = from; i <= to; i++) {
+      const value = horizontal ? ink(i, fixed) : ink(fixed, i);
+      if (value && !previous) runs++;
+      previous = value;
+    }
+    return runs;
+  };
+  const horizontalRuns = inkRunCount(centerY, true);
+  const verticalRuns = inkRunCount(centerX, false);
+  if (horizontalRuns === 2 && verticalRuns === 2) return "○";
+  if ((horizontalRuns === 4 && verticalRuns === 4) || (horizontalRuns === 4 && verticalRuns === 2) || (horizontalRuns === 2 && verticalRuns === 4)) return "◎";
+  return null;
+}
+function parseNameCardText(text) {
+  const lines = String(text ?? "").split(/\r?\n/).map((line) => line.replace(/\u3000/g, " ").trim()).filter(Boolean);
+  const levelLine = lines.find((line) => /Lv[^0-9]{0,3}[0-9]{1,3}/i.test(line));
+  if (!levelLine) {
+    // レベルが読めない画像でも、名前の行だけは拾えることがある（数字と記号だけの行は除く）。
+    const nameLine = lines.filter((line) => /[^\d\s:：.．,，\-ー_|]/.test(line)).pop();
+    return { lv: null, name: nameLine ? nameLine.replace(/^[\s:：.．・･,，\-ー_|]+/, "").trim() || null : null, raw: text ?? "" };
+  }
+  const match = levelLine.match(/Lv[.．,，]?\s*([0-9]{1,3})(.*)$/i);
+  if (!match) return { lv: null, name: null, raw: text ?? "" };
+  const lv = Number(match[1]);
+  let name = match[2] ?? "";
+  // 先頭の区切り記号・空白だけを落とす（末尾の記号は名前の一部として保持する）。
+  name = name.replace(/^[\s:：.．・･,，\-ー_|]+/, "").replace(/\s+$/, "");
+  return { lv: Number.isFinite(lv) ? lv : null, name: name || null, raw: text ?? "" };
+}
+
 var PokemonStatusImageReader = class {
   #worker = null;
+  #debug = false;
   async #getWorker(onProgress) {
     if (this.#worker) return this.#worker;
     const ocrAssetPath = new URL('./ocr', import.meta.url).href.replace(/\/$/, "");
@@ -6313,7 +6600,101 @@ ${outlinedRegionResult?.data.text ?? ""}`;
     // サブスキルは小さく淡い文字が並び、全体OCRの行だけでは取りこぼす。
     // ピル単位で読み取った並び（Lv10→Lv80の位置順）を、Lvや最大所持数の補正より先に渡す。
     const subSkillPillNameList = await recognizeSubSkillNameList(sourceCanvas, worker);
-    return parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList, subSkillPillNameList);
+    // 名前パネルは固定カード。時計や SP、食材のレベルが混ざらないここだけから読む。
+    let nameCard = null;
+    let nameCardText = null;
+    let cardCanvas = null;
+    const cardBox = findNameCardBox(sourceCanvas);
+    if (cardBox) {
+      cardCanvas = createCardTextCanvas(sourceCanvas, cardBox);
+      if (cardCanvas) {
+        await worker.setParameters({
+          tessedit_pageseg_mode: import_tesseract.default.PSM.SINGLE_BLOCK,
+          preserve_interword_spaces: "1"
+        });
+        try {
+          const cardResult = await worker.recognize(cardCanvas.canvas, {}, { text: true });
+          nameCardText = cardResult.data.text;
+          nameCard = parseNameCardText(nameCardText);
+        } finally {
+          await worker.setParameters({
+            tessedit_pageseg_mode: import_tesseract.default.PSM.SPARSE_TEXT,
+            preserve_interword_spaces: "1"
+          });
+        }
+      }
+    }
+    const levelArea = cardBox ? { y0: cardBox.y - Math.round(cardBox.height * 0.2), y1: cardBox.y + cardBox.height + Math.round(cardBox.height * 0.2) } : { y0: 0, y1: Math.round(sourceCanvas.height * 0.32) };
+    // ニックネームの末尾の丸記号（○／◎）は字形で判定し、OCRが余計な1文字を足したときは
+    // 字形の数に合わせて削る（例:「うなこの◎」→ 字形は4つなので「うなこ」＋◎）。
+    let nameFix = null;
+    if (cardCanvas) {
+      const lineList2 = cardLineRunList(cardCanvas.data, cardCanvas.width, cardCanvas.height);
+      const nameLine = lineList2[lineList2.length - 1];
+      if (nameLine) {
+        const runList = cardGlyphRunList(cardCanvas.data, cardCanvas.width, nameLine.y0, nameLine.y1);
+        if (runList.length >= 3) {
+          const mark = classifyCircleGlyph(cardCanvas.data, cardCanvas.width, runList[runList.length - 1], nameLine.y0, nameLine.y1);
+          if (mark) {
+            let splitIndex = 1;
+            let widest = -1;
+            for (let index = 2; index < runList.length; index++) {
+              const gap = runList[index].x0 - runList[index - 1].x1;
+              if (gap > widest) { widest = gap; splitIndex = index; }
+            }
+            const nameGlyphCount = runList.length - splitIndex - 1;
+            if (nameGlyphCount >= 1) nameFix = { mark, glyphCount: nameGlyphCount };
+          }
+        }
+      }
+    }
+    const result = parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList, subSkillPillNameList, nameCard ?? undefined, levelArea, nameFix);
+    if (this.debug) {
+      result.debug = {
+        sourceWidth: image.naturalWidth,
+        sourceHeight: image.naturalHeight,
+        canvasWidth: sourceCanvas.width,
+        cardBox,
+        nameCardText,
+        nameCard: nameCard ?? null,
+        rawText,
+        foodList: foodList.map((food) => ({
+          name: food.name,
+          empty: !!food.empty,
+          occluded: !!food.region?.occluded,
+          num: food.num,
+          region: food.region ? { x: Math.round(food.region.x), y: Math.round(food.region.y), width: Math.round(food.region.width), height: Math.round(food.region.height) } : null,
+          top: (food.matchList ?? []).slice(0, 4).map((match) => [match.name, Math.round(match.score * 1000) / 1000]),
+          rejected: food.rejected ?? null
+        })),
+        subSkillPillNameList,
+        subSkillPillRegionList: (findSubSkillPillRegionList(sourceCanvas, findSubSkillBand(sourceCanvas)) ?? []).map((region) => ({ slot: region.slot, x: Math.round(region.x), y: Math.round(region.y), width: Math.round(region.width), height: Math.round(region.height) })),
+        warnings: result.warnings ?? []
+      };
+      if (cardCanvas) result.debug.cardCrop = cardCanvas.canvas.toDataURL("image/jpeg", 0.8);
+    }
+    return result;
+  }
+  // 開発用: 任意の画像をOCRして生の文字列を返す（診断・調整用）
+  async ocrText(canvas, params = {}) {
+    const worker = await this.#getWorker();
+    const previous = {
+      tessedit_pageseg_mode: import_tesseract.default.PSM.SPARSE_TEXT,
+      preserve_interword_spaces: "1"
+    };
+    await worker.setParameters({ ...previous, ...params });
+    try {
+      const result = await worker.recognize(canvas, {}, { text: true });
+      return result.data.text;
+    } finally {
+      await worker.setParameters(previous);
+    }
+  }
+  get debug() {
+    return this.#debug;
+  }
+  set debug(value) {
+    this.#debug = !!value;
   }
   async terminate() {
     await this.#worker?.terminate();
