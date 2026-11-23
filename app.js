@@ -10,39 +10,161 @@ const refs=encoded.refs.map(r=>({...r,bytes:Uint8Array.from(atob(r.fp),c=>c.char
 const reader=new Reader(), entries=[];
 const headers=['ニックネーム','ポケモン','レベル','スキルレベル','食材1','食材2','食材3','メインスキル','せいかく','Lv10','Lv25','Lv50','Lv70','Lv80'];
 function canvas(w,h){const c=document.createElement('canvas');c.width=w;c.height=h;return c}
+// ===== 個体アイコンの読み取り =====
+// 画面のスクロールや機種で位置がずれても拾えるように、左上の白いカード
+// （赤い枠の浮いたカード）を色から探し、その中で一番大きな絵を切り出す。
+function cardBox(c){
+ const ctx=c.getContext('2d',{willReadFrequently:true}),{data}=ctx.getImageData(0,0,c.width,c.height),w=c.width,h=c.height;
+ const isRed=i=>{const p=i*4,r=data[p],g=data[p+1],b=data[p+2];return r>=180&&r-g>=35&&r-b>=45&&b<=170};
+ const rowList=[];
+ for(let y=0;y<h;y++){
+  let first=-1,last=-1,count=0;
+  for(let x=0;x<w;x++)if(isRed(y*w+x)){count++;if(first<0)first=x;last=x}
+  if(count>=w*0.3&&last-first>=w*0.3)rowList.push({y,first,last});
+ }
+ const top=rowList.find(row=>row.y<h*0.5);
+ if(!top)return null;
+ const maxHeight=Math.round(h*0.16),minGap=Math.max(18,Math.round(h*0.02));
+ const bottom=rowList.find(row=>row.y>top.y+minGap&&row.y-top.y<=maxHeight);
+ const height=bottom?bottom.y-top.y:Math.round(h*0.075);
+ return {data,top:top.y,height,left:Math.max(0,top.first)};
+}
+function spriteBox(c,card){
+ const {data}=card,ctx=c.getContext('2d',{willReadFrequently:true});
+ const h=card.height;
+ const x0=Math.max(0,card.left+2),x1=Math.min(c.width-1,card.left+h+Math.round(h*0.08));
+ const y0=Math.max(0,card.top+3),y1=Math.min(c.height-1,card.top+h-3);
+ const w=x1-x0+1,hei=y1-y0+1;
+ if(w<16||hei<16)return null;
+ const ink=new Uint8Array(w*hei);
+ for(let y=0;y<hei;y++)for(let x=0;x<w;x++){
+  const p=((y0+y)*c.width+(x0+x))*4,r=data[p],g=data[p+1],b=data[p+2];
+  const brightness=r*0.299+g*0.587+b*0.114,chroma=Math.max(r,g,b)-Math.min(r,g,b);
+  ink[y*w+x]=chroma>30||brightness<208?1:0;
+ }
+ const seen=new Uint8Array(ink.length),stack=[];let best=null;
+ for(let start=0;start<ink.length;start++){
+  if(!ink[start]||seen[start])continue;
+  stack.length=0;stack.push(start);seen[start]=1;
+  let area=0,minX=w,maxX=-1,minY=hei,maxY=-1,edge=false;
+  while(stack.length){
+   const i=stack.pop(),x=i%w,y=(i-x)/w;
+   area++;
+   if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
+   if(x<=1||y<=1||x>=w-2||y>=hei-2)edge=true;
+   for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+    const nx=x+dx,ny=y+dy;
+    if(nx<0||nx>=w||ny<0||ny>=hei)continue;
+    const ni=ny*w+nx;
+    if(ink[ni]&&!seen[ni]){seen[ni]=1;stack.push(ni)}
+   }
+  }
+  // カードの枠やアイコンの淡い円は端に触れるので、絵だけを拾う
+  if(!edge&&area>80&&(!best||area>best.area))best={area,minX,maxX,minY,maxY};
+ }
+ if(!best)return null;
+ return {x1:x0+best.minX,y1:y0+best.minY,x2:x0+best.maxX,y2:y0+best.maxY};
+}
+function iconPixels(c,box){
+ const small=canvas(20,20),s=small.getContext('2d',{willReadFrequently:true});
+ s.imageSmoothingEnabled=true;s.imageSmoothingQuality='high';
+ s.drawImage(c,box.x1,box.y1,box.x2-box.x1+1,box.y2-box.y1+1,0,0,20,20);
+ const rgb=s.getImageData(0,0,20,20).data;
+ return Uint8Array.from({length:1200},(_,i)=>rgb[Math.floor(i/3)*4+i%3]);
+}
+// 縮小されたスクショでも比べられるように、両側を軽くぼかしてから距離を測る。
+function blurPixels(px){
+ const out=new Uint8Array(1200);
+ for(let y=0;y<20;y++)for(let x=0;x<20;x++)for(let ch=0;ch<3;ch++){
+  let sum=0,n=0;
+  for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+   const nx=x+dx,ny=y+dy;
+   if(nx<0||ny<0||nx>=20||ny>=20)continue;
+   sum+=px[(ny*20+nx)*3+ch];n++;
+  }
+  out[(y*20+x)*3+ch]=sum/n;
+ }
+ return out;
+}
+function rankIconPixels(px){
+ const blurred=blurPixels(px);
+ const byName=new Map();
+ for(const ref of refs){
+  const refBlur=blurPixels(ref.bytes);
+  let sum=0;
+  for(let i=0;i<1200;i++){const d=blurred[i]-refBlur[i];sum+=d*d}
+  const distance=Math.sqrt(sum/1200);
+  for(const name of ref.names){
+   const previous=byName.get(name);
+   if(!previous||distance<previous.distance)byName.set(name,{name,distance,ambiguous:ref.names.length>1});
+  }
+ }
+ const sorted=[...byName.values()].sort((a,b)=>a.distance-b.distance);
+ return sorted.map((item,index)=>({...item,gap:(sorted[index+1]?.distance??99)-item.distance}));
+}
 async function icon(url){
  const im=new Image();im.src=url;await im.decode();
  const c=canvas(600,Math.round(600*im.height/im.width)),ctx=c.getContext('2d',{willReadFrequently:true});
  ctx.drawImage(im,0,0,c.width,c.height);
- const {data}=ctx.getImageData(0,0,c.width,c.height);let top=-1;
- for(let y=0;y<c.height*.45;y++){let k=(y*c.width+6)*4;if(data[k]>225&&data[k+1]>85&&data[k+1]<165&&data[k+2]<120){top=y;break}}
- if(top<0)return {};
- let x1=110,y1=top+85,x2=0,y2=0;
- for(let y=top+13;y<top+86;y++)for(let x=39;x<110;x++){
- const k=4*(y*600+x);if(Math.min(data[k],data[k+1],data[k+2])<210){x1=Math.min(x1,x);x2=Math.max(x2,x);y1=Math.min(y1,y);y2=Math.max(y2,y)}}
- if(x2<=x1||y2<=y1)return {};
- const small=canvas(20,20),s=small.getContext('2d');s.drawImage(c,x1,y1,x2-x1+1,y2-y1+1,0,0,20,20);
- const rgb=s.getImageData(0,0,20,20).data;
- const score=arr=>{let sum=0;for(let i=0;i<1200;i++)sum+=(arr[i]-rgb[Math.floor(i/3)*4+i%3])**2;return Math.sqrt(sum/1200)};
+ const card=cardBox(c);
+ let box=card?spriteBox(c,card):null;
+ if(card&&!box){
+  // カードは見えたが絵を切り出せないときは、カード上端からの相対位置で拾う
+  const top=card.top;
+  box={x1:39,y1:Math.min(c.height-1,top+13),x2:Math.min(c.width-1,110),y2:Math.min(c.height-1,top+86)};
+ }
  // OCR sometimes reads the circular nickname mark ◎ as @. Check the glyph itself.
- let right=-1,left=-1;
- const ink=(x,y)=>data[4*(y*600+x)]<190;
- const onCol=x=>Array.from({length:24},(_,dy)=>ink(x,top+54+dy)).some(Boolean);
- for(let x=332;x>175;x--)if(onCol(x)){right=x;break}
- left=right;
- while(left>175&&onCol(left-1))left--;
- let glyphTop=top+80,glyphBottom=top+50;
- for(let y=top+54;y<top+78;y++)for(let x=left;x<=right;x++)if(x>=0&&ink(x,y)){glyphTop=Math.min(glyphTop,y);glyphBottom=Math.max(glyphBottom,y)}
- const w=right-left+1,h=glyphBottom-glyphTop+1;
- function bands(horizontal){let runs=0,previous=false;for(let i=0;i<(horizontal?w:h);i++){let v=horizontal?ink(left+i,Math.round((glyphTop+glyphBottom)/2)):ink(Math.round((left+right)/2),glyphTop+i);if(v&&!previous)runs++;previous=v}return runs}
- const circle=w>=10&&w<=18&&Math.abs(w-h)<=2&&bands(true)===4&&bands(false)===4;
-
- const fp=Uint8Array.from({length:1200},(_,i)=>rgb[Math.floor(i/3)*4+i%3]);
- const key=btoa(String.fromCharCode(...fp));let learned={};try{learned=JSON.parse(localStorage.iconLabels||'{}')}catch{}
- const matches=Object.entries(learned).map(([k,n])=>[n,score(Uint8Array.from(atob(k),c=>c.charCodeAt(0)))]).sort((a,b)=>a[1]-b[1]);
- if(matches[0]?.[1]<9)return {circle,name:matches[0][0],key,confident:true};
- return {circle,key,...rankIcons(refs,score)};
+ let circle=false;
+ if(card&&box){
+  const {data}=card;
+  const ink=(x,y)=>data[4*(y*c.width+x)]<190;
+  const onCol=x=>Array.from({length:24},(_,dy)=>ink(x,card.top+54+dy)).some(Boolean);
+  let right=-1;
+  for(let x=332;x>175;x--)if(onCol(x)){right=x;break}
+  let left=right;
+  while(left>175&&onCol(left-1))left--;
+  let glyphTop=card.top+80,glyphBottom=card.top+50;
+  for(let y=card.top+54;y<card.top+78;y++)for(let x=left;x<=right;x++)if(x>=0&&ink(x,y)){glyphTop=Math.min(glyphTop,y);glyphBottom=Math.max(glyphBottom,y)}
+  const w=right-left+1,h=glyphBottom-glyphTop+1;
+  const bands=horizontal=>{let runs=0,previous=false;for(let i=0;i<(horizontal?w:h);i++){const v=horizontal?ink(left+i,Math.round((glyphTop+glyphBottom)/2)):ink(Math.round((left+right)/2),glyphTop+i);if(v&&!previous)runs++;previous=v}return runs};
+  circle=w>=10&&w<=18&&Math.abs(w-h)<=2&&bands(true)===4&&bands(false)===4;
+ }
+ if(!box)return {circle,ranking:[],confident:false};
+ const fp=iconPixels(c,box);
+ const key=btoa(String.fromCharCode(...fp));
+ let learned={};try{learned=JSON.parse(localStorage.iconLabels||'{}')}catch{}
+ const learnedList=Object.entries(learned).map(([k,n])=>{
+  const bytes=Uint8Array.from(atob(k),ch=>ch.charCodeAt(0));
+  let sum=0;for(let i=0;i<1200;i++){const d=fp[i]-bytes[i];sum+=d*d}
+  return [n,Math.sqrt(sum/1200)];
+ }).sort((a,b)=>a[1]-b[1]);
+ if(learnedList[0]?.[1]<9)return {circle,name:learnedList[0][0],key,confident:true,ranking:[{name:learnedList[0][0],distance:learnedList[0][1],gap:99}]};
+ const ranking=rankIconPixels(fp);
+ const best=ranking[0];
+ return {circle,key,ranking,confident:Boolean(best&&best.distance<26&&best.gap>5&&!best.ambiguous),name:best?.name??null};
 }
+// アイコンと、画面から読んだメインスキル・食材の両方で種族を決める。
+function pickSpecies(match,r,db){
+ const ranking=match.ranking||[],best=ranking[0],estimate=r.pokemonName||'';
+ const compatibility=name=>{
+  const mon=db.mons.find(m=>m.name===name);
+  if(!mon)return -1;
+  let score=0;
+  if(r.mainSkillName&&mon.skill===r.mainSkillName)score+=2;
+  (r.foodList||[]).forEach((food,index)=>{if(food&&(mon.foodSlots?.[index]||[]).includes(food))score++});
+  return score;
+ };
+ if(!best)return estimate?{name:estimate,confident:false}:{name:'',confident:false};
+ if(estimate&&best.name===estimate)return {name:estimate,confident:true};
+ const estimateScore=estimate?compatibility(estimate):-1,bestScore=compatibility(best.name);
+ if(estimate&&estimateScore>=3&&estimateScore>=bestScore&&best.distance>26)return {name:estimate,confident:false};
+ if(best.distance<=26&&best.gap>=5)return {name:best.name,confident:true};
+ if(best.distance<=40&&bestScore>=3)return {name:best.name,confident:true};
+ if(estimate&&estimateScore>=3)return {name:estimate,confident:false};
+ if(best.distance<=42)return {name:best.name,confident:false};
+ return {name:'',confident:false};
+}
+
 function field(label,value,options){
  const wrap=document.createElement('label');wrap.append(label);
  const el=document.createElement(options?'select':'input');el.setAttribute('aria-label',label);
@@ -73,7 +195,7 @@ function add(file,url,match,r,id,draft={}){
  const det=document.createElement('details'),summary=document.createElement('summary'),grid=document.createElement('section');
  const pic=document.createElement('details'),ps=document.createElement('summary'),img=new Image();ps.textContent='元のスクショ';if(url){img.src=url;pic.append(ps,img)}else pic.hidden=true;
  const nickname=match.circle?r.name?.replace(/[@＠©]$/,'◎'):r.name;
- const vals=draft.vals||[nickname,match.confident?mon?.name:'',r.lv,r.mainSkillLv,...Array.from({length:3},(_,i)=>r.foodList?.[i]),mon?.skill||r.mainSkillName,r.nature,...Array.from({length:5},(_,i)=>r.subSkillList?.length===5?r.subSkillList[i]:'')];
+ const vals=draft.vals||[nickname,match.name?mon?.name??match.name:'',r.lv,r.mainSkillLv,...Array.from({length:3},(_,i)=>r.foodList?.[i]),mon?.skill||r.mainSkillName,r.nature,...Array.from({length:5},(_,i)=>r.subSkillList?.length===5?r.subSkillList[i]:'')];
  const sourceLevel=String(draft.sourceLevel||r.lv||vals[2]||'');
  const controls=headers.map((label,i)=>{
  const opts=i===1?db.mons.map(m=>m.name):i>=4&&i<=6?db.foods:i===7?db.skills:i===8?db.natures:i>=9?db.subs:null;
@@ -99,7 +221,7 @@ async function run(files){
  for(const [i,file] of Array.from(files).entries()){
  const url=URL.createObjectURL(file);let match={},r={};
  $('status').textContent=(i+1)+' / '+files.length+' 枚を読み取り中…';
- try{match=await icon(url);r=await reader.read(file,match.confident?match.name:'')}catch(e){URL.revokeObjectURL(url);rejected.push(file.name+'（読み取り失敗）');continue}
+ try{match=await icon(url);r=await reader.read(file,'');const picked=pickSpecies(match,r,db);match={...match,name:picked.name,confident:picked.confident}}catch(e){URL.revokeObjectURL(url);rejected.push(file.name+'（読み取り失敗）');continue}
  if(!isDetailScreen(r)){URL.revokeObjectURL(url);rejected.push(file.name+'（詳細画面を確認できません）');continue}
  const hash=await fingerprint(file);
  let preview='';try{const im=new Image();im.src=url;await im.decode();const c=canvas(500,Math.round(500*im.height/im.width));c.getContext('2d').drawImage(im,0,0,c.width,c.height);preview=c.toDataURL('image/jpeg',0.7)}catch{}

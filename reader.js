@@ -5514,7 +5514,7 @@ function correctResult(result, foodRecognitionList, iconName) {
     mainSkillName: correctedMainSkillName
   };
 }
-function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList) {
+function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList, subSkillPillNameList = null) {
   const normalizedRawText = normalizeText(rawText);
   const levelLineList = primaryLineList.map((line) => ({ line, match: normalizeText(line.text).match(/Lv\.?([0-9]{1,3})(.*)/i) })).filter((item) => item.match != null).toSorted((a, b) => a.line.y0 - b.line.y0);
   const pokemonLevelLine = levelLineList[0];
@@ -5534,7 +5534,7 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
   const subSkillLineList = sourceCoordinateLineList.filter(
     (line) => line.y0 > (primaryMainSkillLine?.line?.y0 ?? pokemonLevelLine?.line.y0 ?? -1) && (primaryDetailStatusLine?.score < 0.45 || line.y0 < primaryDetailStatusLine.line.y0)
   );
-  const subSkillList = subSkillLineList.flatMap(splitSubSkillLine).map(
+  const subSkillLineNameList = subSkillLineList.flatMap(splitSubSkillLine).map(
     (line) => sub_skill_default.list.map((subSkill) => {
       const textScore = getTextSimilarity(subSkill.name, line.text);
       const rarityScore = line.subSkillRarity == subSkill.rarity ? 0.16 : -0.08;
@@ -5544,6 +5544,9 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     const lineHeight = Math.max(a.line.y1 - a.line.y0, b.line.y1 - b.line.y0);
     return Math.abs(a.line.y0 - b.line.y0) <= lineHeight ? a.line.x0 - b.line.x0 : a.line.y0 - b.line.y0;
   }).map((item) => item.name);
+  // ピル単位で読み取れたサブスキルは位置順に信頼できるので、行OCRの推定より優先する。
+  // 3つ未満しか読めないとき（縮小された画像など）は従来の行OCRの結果を使う。
+  const subSkillList = subSkillPillNameList && subSkillPillNameList.length >= 3 ? subSkillPillNameList : subSkillLineNameList;
   const nature = nature_default.list.map((item) => ({ name: item.name, match: findBestLine(item.name, lineList) })).toSorted((a, b) => b.match.score - a.match.score)[0];
   const result = {
     name: parsedName || null,
@@ -5955,6 +5958,235 @@ async function recognizeFoodList(sourceCanvas) {
     };
   });
 }
+// --- サブスキルのピル読み取り -------------------------------------------------
+// 画面のスクロール量や端末の機種で位置がずれても読めるように、緑の見出し帯
+// （メインスキル・サブスキル / 詳細ステータス）を基準に帯を決め、その中の
+// 角丸ピルを色と行の分布から探して、1枚ずつ拡大・二値化してからOCRする。
+function subSkillRunList(flagList, minimumGap) {
+  const runList = [];
+  let start = -1;
+  let last = -1;
+  for (let index = 0; index < flagList.length; index++) {
+    if (!flagList[index]) continue;
+    if (start < 0) start = index;
+    else if (index - last > minimumGap) {
+      runList.push([start, last]);
+      start = index;
+    }
+    last = index;
+  }
+  if (start >= 0) runList.push([start, last]);
+  return runList;
+}
+function subSkillRegionGray(sourceCanvas, x, y, width, height) {
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const { data } = context.getImageData(x, y, width, height);
+  const gray = new Float32Array(width * height);
+  const chroma = new Uint8Array(width * height);
+  for (let index = 0; index < gray.length; index++) {
+    const pixelIndex = index * 4;
+    const red = data[pixelIndex];
+    const green = data[pixelIndex + 1];
+    const blue = data[pixelIndex + 2];
+    gray[index] = red * 0.299 + green * 0.587 + blue * 0.114;
+    chroma[index] = Math.max(red, green, blue) - Math.min(red, green, blue);
+  }
+  return { gray, chroma };
+}
+function findSubSkillBarList(sourceCanvas) {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+  const context = sourceCanvas.getContext("2d", { willReadFrequently: true });
+  const { data } = context.getImageData(0, 0, width, height);
+  const greenCountByRow = new Array(height).fill(0);
+  for (let y = 0; y < height; y++) {
+    let count = 0;
+    for (let x = 0; x < width; x++) {
+      const pixelIndex = (y * width + x) * 4;
+      const red = data[pixelIndex];
+      const green = data[pixelIndex + 1];
+      const blue = data[pixelIndex + 2];
+      if (green >= 150 && green - red >= 45 && green - blue >= 40) count++;
+    }
+    greenCountByRow[y] = count;
+  }
+  // 見出し帯は横幅いっぱいの塗り、左側の緑ラベル（食材・おてつだい時間など）はずっと細い。
+  const barList = [];
+  for (const [start, end] of subSkillRunList(greenCountByRow.map((count) => count >= width * 0.6), 4)) {
+    const barHeight = end - start + 1;
+    if (barHeight >= 20 && barHeight <= 320) barList.push({ y: start, height: barHeight });
+  }
+  return barList;
+}
+function findSubSkillBand(sourceCanvas) {
+  const barList = findSubSkillBarList(sourceCanvas);
+  if (barList.length >= 2) {
+    return { y0: barList[0].y + barList[0].height, y1: barList[1].y };
+  }
+  if (barList.length == 1) {
+    return { y0: barList[0].y + barList[0].height, y1: Math.round(sourceCanvas.height * 0.98) };
+  }
+  return { y0: 0, y1: sourceCanvas.height };
+}
+function findSubSkillPillRegionList(sourceCanvas, band) {
+  const width = sourceCanvas.width;
+  const height = band.y1 - band.y0;
+  if (width < 120 || height < 40) return [];
+  const { gray, chroma } = subSkillRegionGray(sourceCanvas, 0, band.y0, width, height);
+  const mask = new Uint8Array(width * height);
+  for (let index = 0; index < mask.length; index++) {
+    mask[index] = gray[index] < 246 || chroma[index] > 12 ? 1 : 0;
+  }
+  const rowCount = new Array(height).fill(0);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) rowCount[y] += mask[y * width + x];
+  }
+  const rowList = subSkillRunList(rowCount.map((count) => count > width * 0.02), 14).map(([start, end]) => [start + band.y0, end + band.y0]).filter(([start, end]) => end - start >= 40 && end - start <= 260);
+  const regionList = [];
+  for (const [rowStart, rowEnd] of rowList) {
+    const columnCount = new Array(width).fill(0);
+    for (let y = rowStart; y <= rowEnd; y++) {
+      for (let x = 0; x < width; x++) columnCount[x] += mask[(y - band.y0) * width + x];
+    }
+    const columnList = subSkillRunList(columnCount.map((count) => count > 2), 16).filter(([start, end]) => end - start >= width * 0.18 && end - start <= width * 0.55);
+    for (const [columnStart, columnEnd] of columnList) {
+      regionList.push({ x: columnStart, y: rowStart, width: columnEnd - columnStart + 1, height: rowEnd - rowStart + 1 });
+    }
+  }
+  return regionList;
+}
+// ピルの中の文字の行（Lv.50 のような鍵バッジは避ける）を切り出し、濃淡を伸ばして拡大する。
+function createSubSkillLineCanvas(sourceCanvas, region, option) {
+  const scale = option?.scale ?? 3;
+  const padding = option?.padding ?? 0.05;
+  const darkRate = option?.darkRate ?? 0.02;
+  const lightRate = option?.lightRate ?? 0.9;
+  const border = Math.max(3, Math.round(region.height * 0.12));
+  const width = region.width - border * 2;
+  const height = region.height - border * 2;
+  if (width < 20 || height < 16) return null;
+  const { gray } = subSkillRegionGray(sourceCanvas, region.x + border, region.y + border, width, height);
+  const threshold = 190;
+  const rowInk = new Array(height).fill(0);
+  const columnInk = new Array(width).fill(0);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (gray[y * width + x] < threshold) {
+        rowInk[y]++;
+        columnInk[x]++;
+      }
+    }
+  }
+  // 端から端まで埋まった行・列は枠線なので文字の行から除く。
+  const rowFlagList = rowInk.map((count) => count > width * 0.01 && count < width * 0.7);
+  const columnIsText = columnInk.map((count) => count < height * 0.7);
+  const lineList = subSkillRunList(rowFlagList, 3).map(([start, end]) => {
+    const hitList = new Uint8Array(width);
+    let ink = 0;
+    for (let y = start; y <= end; y++) {
+      for (let x = 0; x < width; x++) {
+        if (columnIsText[x] && gray[y * width + x] < threshold) {
+          hitList[x] = 1;
+          ink++;
+        }
+      }
+    }
+    return { start, end, ink, coverage: hitList.reduce((sum, value) => sum + value, 0) };
+  }).filter((line) => line.end - line.start >= 8);
+  if (!lineList.length) return null;
+  const line = lineList.toSorted((left, right) => right.coverage - left.coverage || right.ink - left.ink)[0];
+  const lineY = Math.max(0, line.start - Math.round(height * padding));
+  const lineHeight = Math.min(height - lineY, line.end - line.start + 1 + Math.round(height * padding * 2));
+  const histogram = new Array(256).fill(0);
+  let total = 0;
+  for (let y = lineY; y < lineY + lineHeight; y++) {
+    for (let x = 0; x < width; x++) {
+      histogram[Math.min(255, Math.max(0, Math.round(gray[y * width + x])))]++;
+      total++;
+    }
+  }
+  let accumulated = 0;
+  let dark = 0;
+  let light = 255;
+  for (let value = 0; value < 256; value++) {
+    accumulated += histogram[value];
+    if (accumulated >= total * darkRate) {
+      dark = value;
+      break;
+    }
+  }
+  accumulated = 0;
+  for (let value = 0; value < 256; value++) {
+    accumulated += histogram[value];
+    if (accumulated >= total * lightRate) {
+      light = value;
+      break;
+    }
+  }
+  const span = Math.max(20, light - dark);
+  const canvas = createCanvas(Math.round(width * scale), Math.round(lineHeight * scale));
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const imageData = context.createImageData(canvas.width, canvas.height);
+  for (let y = 0; y < canvas.height; y++) {
+    for (let x = 0; x < canvas.width; x++) {
+      const sourceX = Math.min(width - 1, Math.floor(x / scale));
+      const sourceY = Math.min(lineHeight - 1, Math.floor(y / scale));
+      const value = (gray[(lineY + sourceY) * width + sourceX] - dark) / span < 0.5 ? 0 : 255;
+      const pixelIndex = (y * canvas.width + x) * 4;
+      imageData.data[pixelIndex] = value;
+      imageData.data[pixelIndex + 1] = value;
+      imageData.data[pixelIndex + 2] = value;
+      imageData.data[pixelIndex + 3] = 255;
+    }
+  }
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+}
+function selectSubSkillName(recognizedText) {
+  const cleaned = normalizeText(recognizedText).replace(/Lv\.?[0-9]+/gi, "");
+  if (!cleaned) return null;
+  // 「M」「L」の読み分けは最後の1文字に頼りやすいので、末尾の記号が読めている間はその大きさだけを候補にする。
+  const sizeMatch = cleaned.match(/([SML])$/);
+  const sizeFilteredList = sizeMatch ? sub_skill_default.list.filter((subSkill) => subSkill.name.endsWith(sizeMatch[1])) : [];
+  const candidateList = sizeFilteredList.length ? sizeFilteredList : sub_skill_default.list;
+  const best = candidateList.map((subSkill) => ({ name: subSkill.name, score: getTextSimilarity(subSkill.name, cleaned) })).toSorted((left, right) => right.score - left.score)[0];
+  return best && best.score >= 0.62 ? best.name : null;
+}
+async function recognizeSubSkillNameList(sourceCanvas, worker) {
+  const regionList = findSubSkillPillRegionList(sourceCanvas, findSubSkillBand(sourceCanvas));
+  if (!regionList.length) return [];
+  await worker.setParameters({
+    tessedit_pageseg_mode: import_tesseract.default.PSM.SINGLE_LINE,
+    preserve_interword_spaces: "0"
+  });
+  const nameList = [];
+  try {
+    // 時間がかかりすぎないよう、候補は上から順に最大8個まで見る（5つ読めたら終了）。
+    for (const region of regionList.slice(0, 8)) {
+      if (nameList.length >= 5) break;
+      const optionList = [
+        { scale: 3, padding: 0.05, darkRate: 0.02, lightRate: 0.9 },
+        { scale: 4, padding: 0.08, darkRate: 0.01, lightRate: 0.8 }
+      ];
+      let name = null;
+      for (const option of optionList) {
+        const canvas = createSubSkillLineCanvas(sourceCanvas, region, option);
+        if (!canvas) continue;
+        const result = await worker.recognize(canvas, {}, { text: true });
+        name = selectSubSkillName(result.data.text);
+        if (name) break;
+      }
+      if (name && !nameList.includes(name)) nameList.push(name);
+    }
+  } finally {
+    await worker.setParameters({
+      tessedit_pageseg_mode: import_tesseract.default.PSM.SPARSE_TEXT,
+      preserve_interword_spaces: "1"
+    });
+  }
+  return nameList.slice(0, 5);
+}
+
 var PokemonStatusImageReader = class {
   #worker = null;
   async #getWorker(onProgress) {
@@ -6018,7 +6250,10 @@ var PokemonStatusImageReader = class {
     const rawText = `${rawResult.data.text}
 ${binaryResult.data.text}
 ${outlinedRegionResult?.data.text ?? ""}`;
-    return parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList);
+    // サブスキルは小さく淡い文字が並び、全体OCRの行だけでは取りこぼす。
+    // ピル単位で読み取った並び（Lv10→Lv80の位置順）を、Lvや最大所持数の補正より先に渡す。
+    const subSkillPillNameList = await recognizeSubSkillNameList(sourceCanvas, worker);
+    return parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList, subSkillPillNameList);
   }
   async terminate() {
     await this.#worker?.terminate();
