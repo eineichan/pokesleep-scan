@@ -1,0 +1,10 @@
+画像照合用見本（2026-11-23）
+種族・食材・日本語名称：nitoyon/pokesleep-tool（MIT、LICENSE-nitoyon.txt）
+参照コミット：e4bc581bc2c89e0cc2016625d39c644e0dfe626b
+画像参照元：Serebii.net Pokémon Sleep 各ポケモンページ
+https://www.serebii.net/pokemonsleep/pokemon/tinkatink.shtml
+個別画像URLは icon-catalog.json の source に記録。
+Pokémonの名称・ゲーム画像の権利は各権利者に帰属します。画像素材にコードのMIT/Apacheライセンスが適用されるという意味ではありません。
+元画像を軽量な20×20 RGBの照合用データへ変換。通常・色違い・衣装・地方の姿を含め509見本。
+種族一覧253種類、通常画像の対応253種類、色違い画像の対応252種類（取得画像が透明だったダークライは含めない）。サイズ違いの自動確定はしない。
+見本数は認識精度を保証しません。新種、似た姿、切り取りのずれ等で誤認する場合があります。
