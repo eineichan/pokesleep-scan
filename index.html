@@ -219,13 +219,6 @@ a:active{background:#e3f7ff}
 #management > details > summary::-webkit-details-marker{display:none}
 #management .tools{margin:10px 0 0}
 #management button{font-size:12.5px; padding:9px 14px; min-height:40px}
-#trashList div{
-  margin-top:9px; padding:11px 12px; border-radius:14px; background:#fffafc;
-  border:1.5px solid #ffe4ef; display:flex; flex-wrap:wrap; gap:6px; align-items:center;
-}
-#trashList p{flex:1 1 100%; margin:0 0 2px; font-size:11.5px; color:#6d5673; font-weight:700; line-height:1.45}
-#trashList button{font-size:11px; padding:7px 11px; min-height:34px; border-radius:999px}
-#trashList button:last-child{color:#a8506c; background:#fff1f6; box-shadow:0 2px 0 #ffd3e5}
 #count{font-weight:800; color:#367a92}
 #backupStatus{background:#f6fcff; border:1.5px dashed #d9f1fb; border-radius:12px; padding:9px 11px; color:#4f7d90; font-size:11.5px}
 
@@ -275,11 +268,6 @@ footer{margin:20px 4px 0; text-align:center; font-size:10.5px; color:var(--ink-f
     <div class="tools"><button id="backup">バックアップを保存</button></div>
     <label>バックアップから復元<input type="file" id="restore" accept=".json"></label>
     <small>現在の記録を保持して未登録分を追加します。</small>
-    <details>
-      <summary id="trashCount">ごみ箱（0件）</summary>
-      <p>「完全に削除」すると元に戻せません。元の写真や、にとよん側のデータは削除しません。</p>
-      <div id="trashList"></div>
-    </details>
   </details>
 </main>
 

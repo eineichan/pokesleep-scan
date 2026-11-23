@@ -1,5 +1,4 @@
 import {rankIcons} from './icon-match.js';
-import {moveToTrash,restoreTrash,purgeTrash} from './trash.js';
 import {cachedCatalog,checkCatalog} from './catalog-update.js';
 import {isDetailScreen} from './image-check.js';
 import {transaction,put,snapshot,restore,parseBaseline,stateOf} from './safety.js';
@@ -71,8 +70,7 @@ function add(file,url,match,r,hash,draft={}){
  const edit=()=>{refresh();persist().catch(report)};
  controls.forEach(el=>el.oninput=edit);
  controls[1].onchange=()=>{const m=db.mons.find(m=>m.name===controls[1].value);if(m){controls[7].value=m.skill;if(m.foods[0])controls[4].value=m.foods[0];if(match.key){try{const all=JSON.parse(localStorage.iconLabels||'{}');all[match.key]=m.name;localStorage.iconLabels=JSON.stringify(all)}catch{}}}edit()};
- const remove=document.createElement('button');remove.textContent='削除';remove.onclick=()=>deleteItem('drafts',hash);
- det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
+ const remove=document.createElement('button');remove.textContent='削除';remove.onclick=()=>deleteItem('drafts',hash); det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
  $('rows').append(det);const entry={det,controls,hash,url,refresh,persist};entries.push(entry);$('exportArea').hidden=false;return entry;
 }
 async function run(files){
@@ -88,7 +86,7 @@ async function run(files){
  let preview='';try{const im=new Image();im.src=url;await im.decode();const c=canvas(500,Math.round(500*im.height/im.width));c.getContext('2d').drawImage(im,0,0,c.width,c.height);preview=c.toDataURL('image/jpeg',0.7)}catch{}
  await add(file,url,match,r,hash,{preview}).persist();
  }
- $('status').textContent=(entries.length>before?(entries.length-before)+'匹を追加。':'追加なし。')+'合計 '+entries.length+'匹。項目をタップすると修正できます。'+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
+ $('status').textContent=(entries.length>before?(entries.length-before)+'匹を追加。':'追加はありませんでした。')+(entries.length?'合計 '+entries.length+'匹。項目をタップすると修正できます。':'')+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
 }
 $('files').onchange=e=>run(Array.from(e.target.files)).catch(report).finally(()=>{$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value=''});
 function output(batch=entries){
@@ -109,7 +107,6 @@ async function init(){
  const live=new Set(data.drafts.filter(r=>!r.deletedAt).map(r=>r.id));
  for(const e of [...entries])if(!live.has(e.hash)){e.det.remove();entries.splice(entries.indexOf(e),1);if(e.url)URL.revokeObjectURL(e.url)}
  $('exportArea').hidden=!entries.length;
- renderTrash(data);
  for(const row of data.drafts.filter(r=>!r.deletedAt))if(!entries.some(e=>e.hash===row.id))add({name:row.filename||'下書き'},row.preview||'',{confident:true},{},row.id,row);
  for(const e of entries)e.refresh();
  $('count').textContent='登録済みの照合データ '+reference.length+'件'
@@ -153,15 +150,5 @@ backupStatus();
 checkCatalog(bundled,{storage:catalogStorage}).catch(()=>{});
 
 async function deleteItem(table,id){
- try{await moveToTrash(database,table,id);await init();message('削除しました。「データ管理」の「ごみ箱」から戻せます。')}catch(e){report(e)}
-}
-function renderTrash(data){
- const groups=new Map();for(const table of ['records','drafts','baseline'])for(const row of data[table])if(row.deletedAt&&!groups.has(row.trashGroup))groups.set(row.trashGroup,{row,table});
- $('trashCount').textContent='ごみ箱（'+groups.size+'件）';const frag=document.createDocumentFragment();
- for(const [group,{row,table}] of groups){const d=document.createElement('div'),text=document.createElement('p'),b=document.createElement('button');text.textContent=(row.vals[0]||row.vals[1]||'読み取り結果')+' ／ '+(row.vals[1]||'種族未選択')+'（'+({records:'保存個体',drafts:'下書き',baseline:'照合データ'}[table])+'）';b.textContent='元に戻す';b.onclick=async()=>{try{await restoreTrash(database,group);await init();message('元に戻しました。')}catch(e){report(e)}};const del=document.createElement('button');del.textContent='完全に削除';del.onclick=async()=>{
- if(!confirm(text.textContent+'\nこのデータを完全に削除しますか？\nごみ箱から元に戻せなくなります。保存済みのバックアップファイルは変更されません。'))return;
- del.disabled=true;b.disabled=true;
- try{const count=await purgeTrash(database,group);await init();message(count?'完全に削除しました。':'対象は別の画面で変更されています。現在の状態を表示しました。')}catch(e){del.disabled=false;b.disabled=false;report(e)}
- };d.append(text,b,del);frag.append(d)}
- $('trashList').replaceChildren(frag);
+ try{await transaction(database,[table],t=>t.objectStore(table).delete(id));await init();message('削除しました。')}catch(e){report(e)}
 }
