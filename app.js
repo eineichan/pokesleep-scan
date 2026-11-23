@@ -1,8 +1,6 @@
 import {rankIcons} from './icon-match.js';
 import {cachedCatalog,checkCatalog} from './catalog-update.js';
 import {isDetailScreen} from './image-check.js';
-import {transaction,put,snapshot,restore,parseBaseline,stateOf} from './safety.js';
-import {openBox,fingerprint,possible} from './box.js';
 import Reader from './reader.js';
 const $=id=>document.getElementById(id);
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
@@ -51,7 +49,26 @@ function field(label,value,options){
  if(options)for(const s of ['',...new Set([...options,...(value?[String(value)]:[])])])el.add(new Option(s||'選んでください',s));
  el.value=value??'';wrap.append(el);return [wrap,el]
 }
-function add(file,url,match,r,hash,draft={}){
+// Drafts stay on this device only, so cards survive an accidental refresh or a closed tab.
+const database=new Promise((resolve,reject)=>{
+ const req=indexedDB.open('pokesleep-personal-box',2);
+ req.onupgradeneeded=()=>{if(!req.result.objectStoreNames.contains('drafts'))req.result.createObjectStore('drafts',{keyPath:'id'})};
+ req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)
+});
+function drafts(action,mode='readonly'){
+ return database.then(db=>new Promise((resolve,reject)=>{
+  const tx=db.transaction('drafts',mode);let result;
+  const request=action(tx.objectStore('drafts'));if(request)request.onsuccess=()=>result=request.result;
+  tx.oncomplete=()=>resolve(result);tx.onabort=()=>reject(tx.error||Error('保存できませんでした'))
+ }))
+}
+const saveDraft=row=>drafts(s=>s.put(row),'readwrite');
+const removeDraft=id=>drafts(s=>s.delete(id),'readwrite');
+async function fingerprint(file){
+ const bytes=new Uint8Array(await crypto.subtle.digest('SHA-256',await file.arrayBuffer()));
+ return Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('')
+}
+function add(file,url,match,r,id,draft={}){
  const mon=db.mons.find(m=>m.name===match.name)||db.mons.find(m=>m.name===r.pokemonName||m.name.replaceAll(' ','')===r.pokemonName);
  const det=document.createElement('details'),summary=document.createElement('summary'),grid=document.createElement('section');
  const pic=document.createElement('details'),ps=document.createElement('summary'),img=new Image();ps.textContent='元のスクショ';if(url){img.src=url;pic.append(ps,img)}else pic.hidden=true;
@@ -64,100 +81,79 @@ function add(file,url,match,r,hash,draft={}){
  if(i===2||i===3){el.type='number';el.min=1;el.max=i===2?100:10;el.step=1}
  grid.append(wrap);return el
  });
- function refresh(){summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'')+(reference.length?' · '+stateOf(controls.map(c=>c.value),reference):'');}
+ function refresh(){summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'');}
  const values=()=>controls.map(c=>c.value);
- const persist=()=>put(database,'drafts',{id:hash,vals:values(),filename:file.name,sourceLevel,preview:draft.preview||'',date:Date.now()});
+ const persist=()=>saveDraft({id,vals:values(),filename:file.name,sourceLevel,preview:draft.preview||'',date:Date.now()});
  const edit=()=>{refresh();persist().catch(report)};
  controls.forEach(el=>el.oninput=edit);
  controls[1].onchange=()=>{const m=db.mons.find(m=>m.name===controls[1].value);if(m){controls[7].value=m.skill;if(m.foods[0])controls[4].value=m.foods[0];if(match.key){try{const all=JSON.parse(localStorage.iconLabels||'{}');all[match.key]=m.name;localStorage.iconLabels=JSON.stringify(all)}catch{}}}edit()};
  const remove=document.createElement('button');remove.textContent='削除'; det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
- $('rows').append(det);const entry={det,controls,hash,url,refresh,persist,remove};entries.push(entry);remove.onclick=()=>deleteItem('drafts',hash,entry);$('exportArea').hidden=false;return entry;
+ $('rows').append(det);const entry={det,controls,id,url,refresh,persist};entries.push(entry);remove.onclick=()=>removeCard(entry);$('exportArea').hidden=false;return entry;
 }
 async function run(files){
  if(!files.length)return;
  const rejected=[],before=entries.length;
  $('files').disabled=true;$('copy').disabled=$('save').disabled=true;
  for(const [i,file] of Array.from(files).entries()){
- const hash=await fingerprint(file);
  const url=URL.createObjectURL(file);let match={},r={};
  $('status').textContent=(i+1)+' / '+files.length+' 枚を読み取り中…';
  try{match=await icon(url);r=await reader.read(file,match.confident?match.name:'')}catch(e){URL.revokeObjectURL(url);rejected.push(file.name+'（読み取り失敗）');continue}
  if(!isDetailScreen(r)){URL.revokeObjectURL(url);rejected.push(file.name+'（詳細画面を確認できません）');continue}
+ const hash=await fingerprint(file);
  let preview='';try{const im=new Image();im.src=url;await im.decode();const c=canvas(500,Math.round(500*im.height/im.width));c.getContext('2d').drawImage(im,0,0,c.width,c.height);preview=c.toDataURL('image/jpeg',0.7)}catch{}
- await add(file,url,match,r,hash,{preview}).persist();
+ await add(file,url,match,r,'shot-'+hash+'-'+Date.now(),{preview}).persist();
  }
  $('status').textContent=(entries.length>before?(entries.length-before)+'匹を追加。':'追加はありませんでした。')+(entries.length?'合計 '+entries.length+'匹。項目をタップすると修正できます。':'')+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
 }
 $('files').onchange=e=>run(Array.from(e.target.files)).catch(report).finally(()=>{$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value=''});
-function output(batch=entries){
- for(const {det,controls:c} of batch){let invalid=c.find(e=>!e.validity.valid);const mon=db.mons.find(m=>m.name===c[1].value);
+function problem({controls:c}){
+ let invalid=c.find(e=>!e.validity.valid);const mon=db.mons.find(m=>m.name===c[1].value);
  if(!invalid&&mon?.foods.length){invalid=c.slice(4,7).find((e,i)=>!(mon.foodSlots?.[i]||mon.foods.slice(0,i+1)).includes(e.value))}
- if(invalid){det.open=true;invalid.focus();$('status').textContent='未入力または食材構成に合わない項目を確認してください。';return}}
- const quote=v=>/[",\r\n]/.test(v)?'"'+v.replaceAll('"','""')+'"':v;
+ return invalid
+}
+function output(batch=entries){
+ const quote=v=>/[\",\r\n]/.test(v)?'"'+v.replaceAll('"','""')+'"':v;
  return [headers,...batch.map(r=>r.controls.map(e=>e.value))].map(row=>row.map(quote).join(',')).join('\r\n');
 }
-const storage=openBox();
-let database,reference=[];
 const message=text=>$('status').textContent=text;
 const report=e=>message('処理を完了できませんでした。'+e.message);
 function download(text,name,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000)}
-async function init(){
- database=await storage;
- const data=await snapshot(database);reference=data.baseline.filter(r=>!r.deletedAt);
- const live=new Set(data.drafts.filter(r=>!r.deletedAt).map(r=>r.id));
- for(const e of [...entries])if(!live.has(e.hash)){e.det.remove();entries.splice(entries.indexOf(e),1);if(e.url)URL.revokeObjectURL(e.url)}
- $('exportArea').hidden=!entries.length;
- for(const row of data.drafts.filter(r=>!r.deletedAt))if(!entries.some(e=>e.hash===row.id))add({name:row.filename||'下書き'},row.preview||'',{confident:true},{},row.id,row);
- for(const e of entries)e.refresh();
- $('count').textContent='登録済みの照合データ '+reference.length+'件'
-}
-function newBatch(){
- const batch=[],keys=new Set();let held=0,known=0,merged=0;
- for(const e of entries){
-  const vals=e.controls.map(c=>c.value),state=stateOf(vals,reference),key=JSON.stringify(vals);
-  if(state==='登録済み'){known++;continue}
-  if(e.controls.some(c=>!c.validity.valid)){held++;e.det.open=true;continue}
-  if(keys.has(key)){merged++;continue}
-  if(state==='更新候補'||batch.some(b=>possible(b.vals,vals))){held++;e.det.open=true;continue}
-  keys.add(key);batch.push({e,vals})
- }
- const note=['登録済み '+known+'匹'];if(held)note.push('保留 '+held+'匹');if(merged)note.push('同じ内容の重複 '+merged+'匹はまとめました');
- return {batch,merged,note:note.join('・')}
-}
+// Identical rows are written once, so scanning the same individual twice never doubles the CSV.
 async function send(copy){
- const {batch,note}=newBatch();if(!batch.length){message('新規の出力対象はありません。'+note);return}
- const text=output(batch.map(x=>x.e));if(!text)return;
+ const batch=[],keys=new Set();let merged=0,broken=null;
+ for(const e of entries){
+  if(problem(e)){broken=e;break}
+  const key=JSON.stringify(e.controls.map(c=>c.value));
+  if(keys.has(key)){merged++;continue}
+  keys.add(key);batch.push(e)
+ }
+ if(broken){broken.det.open=true;const f=problem(broken);if(f)f.focus();message('未入力または食材構成に合わない項目を確認してください。');return}
+ if(!batch.length){message('出力できるカードがありません。スクショを選んでね。');return}
+ const text=output(batch);
  let copied=true;
  if(copy){try{await navigator.clipboard.writeText(text)}catch{copied=false;$('fallback').hidden=false;$('fallback').value=text;$('fallback').select()}}
  else download(text,'ポケスリ_新規.csv','text/csv;charset=utf-8');
- message((copied?'新規 '+batch.length+'匹分を出力しました。':'表示されたCSVをコピーしてください。')+note)
+ message(batch.length+'匹分のCSVを'+(copy?(copied?'コピーしたよ。':'表示したからコピーしてね。'):'保存したよ。')+(merged?' 同じ内容の '+merged+'匹はまとめました。':'')+' にとよんの「インポート」に貼ってね。')
 }
 $('copy').onclick=()=>send(true).catch(report);$('save').onclick=()=>send(false).catch(report);
-$('base').onchange=async e=>{try{const f=e.target.files[0];if(!f)return;const rows=parseBaseline(await f.text(),headers);
- await transaction(database,['baseline'],t=>{for(const r of rows)t.objectStore('baseline').put(r)});await init();message('既存CSVを照合用に読み込みました。')
- }catch(err){report(err)}finally{e.target.value=''}};
-$('backup').onclick=async()=>{try{const data=await snapshot(database);try{data.labels=JSON.parse(localStorage.iconLabels||'{}')}catch{}download(JSON.stringify(data),'ポケスリバックアップ-'+new Date().toISOString().slice(0,10)+'.json','application/json');try{localStorage.setItem('pokesleep.backup.requested',new Date().toISOString())}catch{}backupStatus();message('バックアップのダウンロードを開始しました。ファイルが保存されたことを確認してください。')}catch(err){report(err)}};
-$('restore').onchange=async e=>{try{const f=e.target.files[0];if(!f)return;const data=JSON.parse(await f.text());const res=await restore(database,data);if(data.labels){try{localStorage.iconLabels=JSON.stringify({...data.labels,...JSON.parse(localStorage.iconLabels||'{}')})}catch{}}
- await init();message('復元 '+res.added+'件。既存 '+res.skipped+'件は保持しました。')}catch(err){report(err)}finally{e.target.value=''}};
-$('files').disabled=true;init().then(()=>{$('files').disabled=false;if(entries.length)message('下書き '+entries.length+'匹を再開しました。')}).catch(report);
-
-function backupStatus(){
- let date;try{date=localStorage.getItem('pokesleep.backup.requested')}catch{}
- $('backupStatus').textContent=date?'前回のバックアップ出力操作：'+new Date(date).toLocaleString('ja-JP')+'。その後の変更は再度保存してください。':'手持ちはこのブラウザだけに保存されます。取り込み後はバックアップをファイルに保存してください。';
+async function removeCard(entry){
+ const i=entries.indexOf(entry);if(i>=0)entries.splice(i,1);
+ entry.det.remove();if(entry.url)URL.revokeObjectURL(entry.url);
+ try{await removeDraft(entry.id)}catch(e){report(e);return}
+ $('exportArea').hidden=!entries.length;message('削除しました。');
 }
-backupStatus();
+$('clear').onclick=async()=>{
+ if(!entries.length||!confirm('いま並んでいるカードをすべて消しますか？'))return;
+ try{await drafts(s=>s.clear(),'readwrite')}catch(e){report(e);return}
+ for(const e of entries){e.det.remove();if(e.url)URL.revokeObjectURL(e.url)}
+ entries.length=0;$('exportArea').hidden=true;message('カードをすべて削除しました。');
+};
+async function init(){
+ const rows=(await drafts(s=>s.getAll())).filter(r=>!r.deletedAt);
+ for(const row of rows)add({name:row.filename||'スクショ'},row.preview||'',{confident:true},{},row.id,row);
+ for(const e of entries)e.refresh();
+ $('exportArea').hidden=!entries.length;
+}
+$('files').disabled=true;init().then(()=>{$('files').disabled=false;if(entries.length)message('前回のカード '+entries.length+'匹を再開しました。')}).catch(report);
 // Check public data in the background; keep the working catalog on any failure.
 checkCatalog(bundled,{storage:catalogStorage}).catch(()=>{});
-
-async function deleteItem(table,id,entry){
- try{
-  if(table==='drafts'){
-   const rest=entries.filter(e=>e.hash===id&&e!==entry),i=entries.indexOf(entry);
-   if(i>=0)entries.splice(i,1);
-   if(entry){entry.det.remove();if(entry.url)URL.revokeObjectURL(entry.url)}
-   if(!rest.length)await transaction(database,[table],t=>t.objectStore(table).delete(id));
-   $('exportArea').hidden=!entries.length;message('削除しました。');return
-  }
-  await transaction(database,[table],t=>t.objectStore(table).delete(id));await init();message('削除しました。')
- }catch(e){report(e)}
-}

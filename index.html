@@ -194,33 +194,14 @@ a:active{background:#e3f7ff}
 #exportArea small{display:block; margin-top:10px; font-size:11.5px; line-height:1.55; color:var(--ink-faint); font-weight:600}
 #fallback{margin-top:12px}
 
-/* ===== データ管理 ===== */
-#management{
-  margin:18px 0 0; padding:0; border-radius:var(--r-l);
-  background:rgba(255,255,255,.8); border:2px solid #fff; box-shadow:var(--shadow-s); overflow:hidden;
+/* ===== すべて削除（控えめ） ===== */
+.clear-row{display:flex; justify-content:flex-end; margin:14px 0 0}
+#clear{
+  font-size:11.5px; font-weight:800; color:#b4677f; min-height:34px; padding:6px 14px;
+  background:#fff8fb; border:1.5px solid #ffdbe8;
+  box-shadow:none;
 }
-#management > summary{
-  cursor:pointer; list-style:none; padding:15px 16px; font-size:13.5px; font-weight:800; color:#6d5673;
-  display:flex; align-items:center; gap:7px;
-}
-#management > summary::-webkit-details-marker{display:none}
-#management > summary::after{content:"⌄"; margin-left:auto; color:var(--ink-faint); font-size:15px}
-#management[open] > summary{border-bottom:1.5px dashed #ffe0ee; margin-bottom:12px}
-#management > *{position:relative}
-#management > :not(summary){margin-left:16px; margin-right:16px}
-#management label{display:block; font-size:12px; font-weight:800; color:var(--ink-soft); margin-top:6px}
-#management small{display:block; margin:6px 0 10px; font-size:11.5px; color:var(--ink-faint); font-weight:600; line-height:1.55}
-#management p{font-size:11.5px; color:var(--ink-soft); font-weight:600; margin:8px 0}
-#management > details{margin-bottom:14px; border-top:1.5px dashed #ffe0ee; padding-top:10px}
-#management > details > summary{
-  cursor:pointer; list-style:none; font-size:12.5px; font-weight:800; color:#b4677f;
-  background:#fff6fa; border:1.5px solid #ffdbe8; border-radius:999px; padding:8px 14px; display:inline-block;
-}
-#management > details > summary::-webkit-details-marker{display:none}
-#management .tools{margin:10px 0 0}
-#management button{font-size:12.5px; padding:9px 14px; min-height:40px}
-#count{font-weight:800; color:#367a92}
-#backupStatus{background:#f6fcff; border:1.5px dashed #d9f1fb; border-radius:12px; padding:9px 11px; color:#4f7d90; font-size:11.5px}
+#clear:active{background:#ffe9f2; transform:none; box-shadow:none}
 
 footer{margin:20px 4px 0; text-align:center; font-size:10.5px; color:var(--ink-faint); font-weight:600; line-height:1.7}
 </style>
@@ -234,7 +215,7 @@ footer{margin:20px 4px 0; text-align:center; font-size:10.5px; color:var(--ink-f
   <p class="intro">スクショをデータ化して、にとよんCSVにまとめるよ</p>
   <div class="steps">
     <span class="step"><b>1</b> スクショを選ぶ</span>
-    <span class="step s2"><b>2</b> 確認・保存</span>
+    <span class="step s2"><b>2</b> 確認・修正</span>
     <span class="step s3"><b>3</b> にとよんへ貼る</span>
   </div>
 </header>
@@ -256,22 +237,13 @@ footer{margin:20px 4px 0; text-align:center; font-size:10.5px; color:var(--ink-f
       </div>
       <textarea hidden id="fallback" readonly></textarea>
       <a href="https://nitoyon.github.io/pokesleep-tool/iv/" target="_blank" rel="noopener">にとよんのボックスを開く</a>
-      <small>新規の個体だけ出力します。にとよんの「インポート」で読み込んでください。</small>
+      <small>同じ内容のカードは1行にまとめて出力します。にとよんの「インポート」で読み込んでください。</small>
+      <div class="clear-row"><button id="clear">すべて削除</button></div>
     </div>
   </div>
-
-  <details id="management">
-    <summary>⚙️ データ管理</summary>
-    <label>にとよんの既存CSV（日本語）<input id="base" type="file" accept=".csv"></label>
-    <small id="count"></small>
-    <p id="backupStatus"></p>
-    <div class="tools"><button id="backup">バックアップを保存</button></div>
-    <label>バックアップから復元<input type="file" id="restore" accept=".json"></label>
-    <small>現在の記録を保持して未登録分を追加します。</small>
-  </details>
 </main>
 
-<footer>データはこの端末・このブラウザに保存されます。<br>取り込み後はバックアップJSONを保存しておいてね。</footer>
+<footer>スクショと読み取り結果は、この端末・このブラウザの中だけに保存されます。</footer>
 
 </div>
 <script type="module" src="app.js"></script>
