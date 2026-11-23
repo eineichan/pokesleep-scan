@@ -81,14 +81,16 @@ function add(file,url,match,r,id,draft={}){
  if(i===2||i===3){el.type='number';el.min=1;el.max=i===2?100:10;el.step=1}
  grid.append(wrap);return el
  });
- function refresh(){summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'');}
  const values=()=>controls.map(c=>c.value);
+ const entry={det,controls,id,url};
+ function refresh(){summary.textContent=(controls[0].value||file.name)+' ／ '+(controls[1].value||'種族を選択')+(controls.some(e=>!e.validity.valid)?' · 要確認':'');}
  const persist=()=>saveDraft({id,vals:values(),filename:file.name,sourceLevel,preview:draft.preview||'',date:Date.now()});
+ entry.refresh=refresh;entry.persist=persist;
  const edit=()=>{refresh();persist().catch(report)};
  controls.forEach(el=>el.oninput=edit);
  controls[1].onchange=()=>{const m=db.mons.find(m=>m.name===controls[1].value);if(m){controls[7].value=m.skill;if(m.foods[0])controls[4].value=m.foods[0];if(match.key){try{const all=JSON.parse(localStorage.iconLabels||'{}');all[match.key]=m.name;localStorage.iconLabels=JSON.stringify(all)}catch{}}}edit()};
  const remove=document.createElement('button');remove.textContent='削除'; det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
- $('rows').append(det);const entry={det,controls,id,url,refresh,persist};entries.push(entry);remove.onclick=()=>removeCard(entry);$('exportArea').hidden=false;return entry;
+ $('rows').append(det);entries.push(entry);remove.onclick=()=>removeCard(entry);$('exportArea').hidden=false;return entry;
 }
 async function run(files){
  if(!files.length)return;
@@ -119,21 +121,29 @@ const message=text=>$('status').textContent=text;
 const report=e=>message('処理を完了できませんでした。'+e.message);
 function download(text,name,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000)}
 // Identical rows are written once, so scanning the same individual twice never doubles the CSV.
-async function send(copy){
- const batch=[],keys=new Set();let merged=0,broken=null;
+const identity=vals=>JSON.stringify([0,1,4,5,6,8,9,10,11,12,13].map(i=>String(vals[i]??'').normalize('NFKC').trim().toLowerCase()));
+function buildBatch(){
+ const exact=new Set(),groups=new Map(),order=[];let merged=0;
  for(const e of entries){
-  if(problem(e)){broken=e;break}
-  const key=JSON.stringify(e.controls.map(c=>c.value));
-  if(keys.has(key)){merged++;continue}
-  keys.add(key);batch.push(e)
+  const bad=problem(e);if(bad)return {broken:{e,bad}};
+  const vals=e.controls.map(c=>c.value),raw=JSON.stringify(vals);
+  if(exact.has(raw)){merged++;continue}
+  exact.add(raw);
+  const key=identity(vals),prev=groups.get(key);
+  if(!prev){groups.set(key,{e,vals});order.push(key);continue}
+  merged++;if(Number(vals[2])>Number(prev.vals[2]))groups.set(key,{e,vals});
  }
- if(broken){broken.det.open=true;const f=problem(broken);if(f)f.focus();message('未入力または食材構成に合わない項目を確認してください。');return}
- if(!batch.length){message('出力できるカードがありません。スクショを選んでね。');return}
- const text=output(batch);
+ return {batch:order.map(k=>groups.get(k)),merged};
+}
+async function send(copy){
+ if(!entries.length){message('出力できるカードがありません。スクショを選んでね。');return}
+ const {batch,merged,broken}=buildBatch();
+ if(broken){broken.e.det.open=true;broken.bad.focus();message('未入力または食材構成に合わない項目を確認してください。');return}
+ const text=output(batch.map(x=>x.e));
  let copied=true;
- if(copy){try{await navigator.clipboard.writeText(text)}catch{copied=false;$('fallback').hidden=false;$('fallback').value=text;$('fallback').select()}}
+ if(copy){try{await navigator.clipboard.writeText(text);$('fallback').hidden=true}catch{copied=false;$('fallback').hidden=false;$('fallback').value=text;$('fallback').select()}}
  else download(text,'ポケスリ_新規.csv','text/csv;charset=utf-8');
- message(batch.length+'匹分のCSVを'+(copy?(copied?'コピーしたよ。':'表示したからコピーしてね。'):'保存したよ。')+(merged?' 同じ内容の '+merged+'匹はまとめました。':'')+' にとよんの「インポート」に貼ってね。')
+ message(batch.length+'匹分のCSVを'+(copy?(copied?'コピーしたよ。':'表示したからコピーしてね。'):'保存したよ。')+(merged?' 同じ個体の '+merged+'匹はまとめました。':'')+' にとよんの「インポート」に貼ってね。')
 }
 $('copy').onclick=()=>send(true).catch(report);$('save').onclick=()=>send(false).catch(report);
 async function removeCard(entry){
