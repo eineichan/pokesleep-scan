@@ -3,7 +3,7 @@ import {moveToTrash,restoreTrash,purgeTrash} from './trash.js';
 import {cachedCatalog,checkCatalog} from './catalog-update.js';
 import {isDetailScreen} from './image-check.js';
 import {transaction,put,snapshot,restore,parseBaseline,stateOf} from './safety.js';
-import {openBox,records,fingerprint,possible,commit} from './box.js';
+import {openBox,fingerprint,possible} from './box.js';
 import Reader from './reader.js';
 const $=id=>document.getElementById(id);
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
@@ -76,10 +76,11 @@ function add(file,url,match,r,hash,draft={}){
  $('rows').append(det);const entry={det,controls,hash,url,refresh,persist};entries.push(entry);$('exportArea').hidden=false;return entry;
 }
 async function run(files){
- let skipped=0;const rejected=[];const seen=new Set(entries.map(e=>e.hash));try{for(const row of (await snapshot(await storage)).records)for(const hash of row.photos)seen.add(hash)}catch{}
+ if(!files.length)return;
+ const rejected=[],before=entries.length;
  $('files').disabled=true;$('copy').disabled=$('save').disabled=true;
  for(const [i,file] of Array.from(files).entries()){
- const hash=await fingerprint(file);if(seen.has(hash)){skipped++;continue}seen.add(hash);
+ const hash=await fingerprint(file);
  const url=URL.createObjectURL(file);let match={},r={};
  $('status').textContent=(i+1)+' / '+files.length+' 枚を読み取り中…';
  try{match=await icon(url);r=await reader.read(file,match.confident?match.name:'')}catch(e){URL.revokeObjectURL(url);rejected.push(file.name+'（読み取り失敗）');continue}
@@ -87,7 +88,7 @@ async function run(files){
  let preview='';try{const im=new Image();im.src=url;await im.decode();const c=canvas(500,Math.round(500*im.height/im.width));c.getContext('2d').drawImage(im,0,0,c.width,c.height);preview=c.toDataURL('image/jpeg',0.7)}catch{}
  await add(file,url,match,r,hash,{preview}).persist();
  }
- $('status').textContent=(skipped?'重複 '+skipped+'枚をスキップ（ごみ箱を含む）。':'')+entries.length+'匹。項目をタップすると修正できます。'+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
+ $('status').textContent=(entries.length>before?(entries.length-before)+'匹を追加。':'追加なし。')+'合計 '+entries.length+'匹。項目をタップすると修正できます。'+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
 }
 $('files').onchange=e=>run(Array.from(e.target.files)).catch(report).finally(()=>{$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value=''});
 function output(batch=entries){
@@ -98,10 +99,9 @@ function output(batch=entries){
  return [headers,...batch.map(r=>r.controls.map(e=>e.value))].map(row=>row.map(quote).join(',')).join('\r\n');
 }
 const storage=openBox();
-let database,reference=[],lastBatch=[];
+let database,reference=[];
 const message=text=>$('status').textContent=text;
 const report=e=>message('処理を完了できませんでした。'+e.message);
-function eraseDraft(id){return transaction(database,['drafts'],t=>t.objectStore('drafts').delete(id))}
 function download(text,name,type){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type}));a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),10000)}
 async function init(){
  database=await storage;
@@ -115,14 +115,17 @@ async function init(){
  $('count').textContent='登録済みの照合データ '+reference.length+'件'
 }
 function newBatch(){
- const batch=[];let held=0,known=0;
+ const batch=[],keys=new Set();let held=0,known=0,merged=0;
  for(const e of entries){
-  const vals=e.controls.map(c=>c.value),state=stateOf(vals,reference);
+  const vals=e.controls.map(c=>c.value),state=stateOf(vals,reference),key=JSON.stringify(vals);
   if(state==='登録済み'){known++;continue}
-  if(state==='更新候補'||batch.some(b=>possible(b.vals,vals))||e.controls.some(c=>!c.validity.valid)){held++;e.det.open=true;continue}
-  batch.push({e,vals})
+  if(e.controls.some(c=>!c.validity.valid)){held++;e.det.open=true;continue}
+  if(keys.has(key)){merged++;continue}
+  if(state==='更新候補'||batch.some(b=>possible(b.vals,vals))){held++;e.det.open=true;continue}
+  keys.add(key);batch.push({e,vals})
  }
- return {batch,note:'登録済み '+known+'匹・保留 '+held+'匹'}
+ const note=['登録済み '+known+'匹'];if(held)note.push('保留 '+held+'匹');if(merged)note.push('同じ内容の重複 '+merged+'匹はまとめました');
+ return {batch,merged,note:note.join('・')}
 }
 async function send(copy){
  const {batch,note}=newBatch();if(!batch.length){message('新規の出力対象はありません。'+note);return}
@@ -130,22 +133,9 @@ async function send(copy){
  let copied=true;
  if(copy){try{await navigator.clipboard.writeText(text)}catch{copied=false;$('fallback').hidden=false;$('fallback').value=text;$('fallback').select()}}
  else download(text,'ポケスリ_新規.csv','text/csv;charset=utf-8');
- lastBatch=batch;$('mark').hidden=false;message((copied?'新規 '+batch.length+'匹分を出力しました。':'表示されたCSVをコピーしてください。')+note)
+ message((copied?'新規 '+batch.length+'匹分を出力しました。':'表示されたCSVをコピーしてください。')+note)
 }
 $('copy').onclick=()=>send(true).catch(report);$('save').onclick=()=>send(false).catch(report);
-async function finish(){
- // Save the exact exported values. Keep subsequent edits as drafts.
- for(const {vals,e} of lastBatch){
-  const rows=await records(database),same=rows.find(r=>r.photos.includes(e.hash));
-  if(!same)await commit(database,null,vals,e.hash);
-  await put(database,'baseline',{id:JSON.stringify(vals),vals});
-  if(JSON.stringify(e.controls.map(c=>c.value))===JSON.stringify(vals)&&(!same||JSON.stringify(same.vals)===JSON.stringify(vals))){
-   await eraseDraft(e.hash);const i=entries.indexOf(e);if(i>=0)entries.splice(i,1);e.det.remove();if(e.url)URL.revokeObjectURL(e.url)
-  }
- }
- $('mark').hidden=true;$('exportArea').hidden=!entries.length;await init();message('取り込み済みとして記録しました。次回の重複を防ぎます。')
-}
-$('mark').onclick=()=>finish().catch(report);
 $('base').onchange=async e=>{try{const f=e.target.files[0];if(!f)return;const rows=parseBaseline(await f.text(),headers);
  await transaction(database,['baseline'],t=>{for(const r of rows)t.objectStore('baseline').put(r)});await init();message('既存CSVを照合用に読み込みました。')
  }catch(err){report(err)}finally{e.target.value=''}};
@@ -163,7 +153,7 @@ backupStatus();
 checkCatalog(bundled,{storage:catalogStorage}).catch(()=>{});
 
 async function deleteItem(table,id){
- try{await moveToTrash(database,table,id);lastBatch=[];$('mark').hidden=true;await init();message('削除しました。「データ管理」の「ごみ箱」から戻せます。')}catch(e){report(e)}
+ try{await moveToTrash(database,table,id);await init();message('削除しました。「データ管理」の「ごみ箱」から戻せます。')}catch(e){report(e)}
 }
 function renderTrash(data){
  const groups=new Map();for(const table of ['records','drafts','baseline'])for(const row of data[table])if(row.deletedAt&&!groups.has(row.trashGroup))groups.set(row.trashGroup,{row,table});
