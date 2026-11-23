@@ -1,9 +1,9 @@
-import {rankIcons} from './icon-match.js?v=20261123f';
-import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123f';
-import {detailScreenCheck} from './image-check.js?v=20261123f';
-import Reader from './reader.js?v=20261123f';
+import {rankIcons} from './icon-match.js?v=20261123g';
+import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123g';
+import {detailScreenCheck} from './image-check.js?v=20261123g';
+import Reader from './reader.js?v=20261123g';
 const $=id=>document.getElementById(id);
-const VERSION='20261123f';
+const VERSION='20261123g';
 const DEBUG=new URLSearchParams(location.search).get('debug')==='1';
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
 let catalogStorage;try{catalogStorage=localStorage}catch{catalogStorage={getItem:()=>null,setItem:()=>{throw Error('保存不可')}}}
@@ -32,41 +32,107 @@ function cardBox(c){
  const height=bottom?bottom.y-top.y:Math.round(h*0.075);
  return {data,top:top.y,height,left:Math.max(0,top.first)};
 }
-function spriteBox(c,card){
- const {data}=card,ctx=c.getContext('2d',{willReadFrequently:true});
- const h=card.height;
- const x0=Math.max(0,card.left+2),x1=Math.min(c.width-1,card.left+h+Math.round(h*0.08));
- const y0=Math.max(0,card.top+3),y1=Math.min(c.height-1,card.top+h-3);
- const w=x1-x0+1,hei=y1-y0+1;
- if(w<16||hei<16)return null;
- const ink=new Uint8Array(w*hei);
- for(let y=0;y<hei;y++)for(let x=0;x<w;x++){
-  const p=((y0+y)*c.width+(x0+x))*4,r=data[p],g=data[p+1],b=data[p+2];
-  const brightness=r*0.299+g*0.587+b*0.114,chroma=Math.max(r,g,b)-Math.min(r,g,b);
-  ink[y*w+x]=chroma>30||brightness<208?1:0;
+// v2.5: 絵を「背景（白いカード／クリーム色の円）から色が離れた画素」で拾い、
+// 小さな隙間を埋めて近くのかたまり同士を1つにまとめる。
+// v2.4 までは「濃い／彩度の高い画素の最大のかたまり」だったため、白い体と青い翼が
+// 離れている種（ウッウ等）では頭だけの 29x37px 断片になり、別の種族に化けていた。
+function closeMask(mask,w,h,radius){
+ let current=mask;
+ for(let step=0;step<radius;step++){
+  const dilated=new Uint8Array(w*h);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+   if(!current[y*w+x])continue;
+   for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+    const ny=y+dy,nx=x+dx;
+    if(nx<0||ny<0||nx>=w||ny>=h)continue;
+    dilated[ny*w+nx]=1;
+   }
+  }
+  const eroded=new Uint8Array(w*h);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+   if(!dilated[y*w+x])continue;
+   let keep=1;
+   for(let dy=-1;dy<=1&&keep;dy++)for(let dx=-1;dx<=1;dx++){
+    const ny=y+dy,nx=x+dx;
+    if(nx<0||ny<0||nx>=w||ny>=h||!dilated[ny*w+nx]){keep=0;break}
+   }
+   if(keep)eroded[y*w+x]=1;
+  }
+  current=eroded;
  }
- const seen=new Uint8Array(ink.length),stack=[];let best=null;
- for(let start=0;start<ink.length;start++){
-  if(!ink[start]||seen[start])continue;
+ return current;
+}
+function maskComponents(mask,w,h){
+ const seen=new Uint8Array(w*h),list=[],stack=[];
+ for(let start=0;start<mask.length;start++){
+  if(!mask[start]||seen[start])continue;
   stack.length=0;stack.push(start);seen[start]=1;
-  let area=0,minX=w,maxX=-1,minY=hei,maxY=-1,edge=false;
+  let area=0,minX=w,maxX=-1,minY=h,maxY=-1,edge=false,cardEdge=false;
   while(stack.length){
    const i=stack.pop(),x=i%w,y=(i-x)/w;
    area++;
    if(x<minX)minX=x;if(x>maxX)maxX=x;if(y<minY)minY=y;if(y>maxY)maxY=y;
-   if(x<=1||y<=1||x>=w-2||y>=hei-2)edge=true;
+   if(x<=1||y<=1||x>=w-2||y>=h-2)edge=true;
+   if(x<=1||y<=1)cardEdge=true;
    for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
     const nx=x+dx,ny=y+dy;
-    if(nx<0||nx>=w||ny<0||ny>=hei)continue;
+    if(nx<0||nx>=w||ny<0||ny>=h)continue;
     const ni=ny*w+nx;
-    if(ink[ni]&&!seen[ni]){seen[ni]=1;stack.push(ni)}
+    if(mask[ni]&&!seen[ni]){seen[ni]=1;stack.push(ni)}
    }
   }
-  // カードの枠やアイコンの淡い円は端に触れるので、絵だけを拾う
-  if(!edge&&area>80&&(!best||area>best.area))best={area,minX,maxX,minY,maxY};
+  if(area>=6)list.push({area,minX,maxX,minY,maxY,edge,cardEdge,used:false});
  }
- if(!best)return null;
- return {x1:x0+best.minX,y1:y0+best.minY,x2:x0+best.maxX,y2:y0+best.maxY};
+ return list;
+}
+function spriteBox(c,card){
+ const {data}=card;
+ const h=card.height;
+ // 絵はカードの高さくらいの大きさで、翼を広げた種は横幅が少しはみ出す。
+ // 切り取り窓を狭くすると翼が窓の端で切れて「端に触れた絵」として捨てられるため、
+ // 横はカード高さの1.25倍まで見る（名前の文字はもっと右から始まる）。
+ const x0=Math.max(0,card.left+2),x1=Math.min(c.width-1,card.left+Math.round(h*1.25));
+ const y0=Math.max(0,card.top+3),y1=Math.min(c.height-1,card.top+h-3);
+ const w=x1-x0+1,hei=y1-y0+1;
+ if(w<16||hei<16)return null;
+ // 白いカード（254,254,254）とクリーム色の円（253,253,237）のどちらからも
+ // 色が離れている画素を絵とする。白い体は「見本画像の背景」と同じ扱いで拾わない。
+ const ink=new Uint8Array(w*hei);
+ for(let y=0;y<hei;y++)for(let x=0;x<w;x++){
+  const p=((y0+y)*c.width+(x0+x))*4,r=data[p],g=data[p+1],b=data[p+2];
+  const whiteGap=Math.max(Math.abs(r-254),Math.abs(g-254),Math.abs(b-254));
+  const creamGap=Math.max(Math.abs(r-253),Math.abs(g-253),Math.abs(b-237));
+  ink[y*w+x]=Math.min(whiteGap,creamGap)>14?1:0;
+ }
+ const closed=closeMask(ink,w,hei,1);
+ const regionList=maskComponents(closed,w,hei);
+ if(!regionList.length)return null;
+ regionList.sort((left,right)=>right.area-left.area);
+ // カードの枠や淡い円は端に触れるので、内側にある絵を主役にする
+ const main=regionList.find(region=>!region.edge&&region.area>=30)
+  ??regionList.find(region=>!region.cardEdge&&region.area>=30)
+  ??regionList[0];
+ main.used=true;
+ let {minX,maxX,minY,maxY}=main;
+ // 頭・翼・脚のように小さな隙間で分かれた部分は、6px までの近さなら同じ絵としてまとめる
+ const bridge=Math.max(4,Math.round(h*0.06));
+ for(let pass=0;pass<regionList.length;pass++){
+  let changed=false;
+  for(const region of regionList){
+   if(region.used)continue;
+   if(region.minX<=maxX+bridge&&region.maxX>=minX-bridge&&region.minY<=maxY+bridge&&region.maxY>=minY-bridge){
+    region.used=true;changed=true;
+    minX=Math.min(minX,region.minX);maxX=Math.max(maxX,region.maxX);
+    minY=Math.min(minY,region.minY);maxY=Math.max(maxY,region.maxY);
+   }
+  }
+  if(!changed)break;
+ }
+ const boxW=maxX-minX+1,boxH=maxY-minY+1;
+ // 想定（カードの高さ≒アイコンの大きさ）より極端に小さい＝断片しか取れていない。
+ // そのまま照合すると小さな断片が1票を投じて誤った種族になるので、照合不能にする。
+ const tooSmall=Math.max(boxW,boxH)<h*0.4;
+ return {x1:x0+minX,y1:y0+minY,x2:x0+maxX,y2:y0+maxY,tooSmall};
 }
 function iconPixels(c,box){
  const small=canvas(20,20),s=small.getContext('2d',{willReadFrequently:true});
@@ -118,7 +184,9 @@ async function icon(url){
  const c=canvas(600,Math.round(600*im.height/im.width)),ctx=c.getContext('2d',{willReadFrequently:true});
  ctx.drawImage(im,0,0,c.width,c.height);
  const card=cardBox(c);
- let box=card?spriteBox(c,card):null;
+ const sprite=card?spriteBox(c,card):null;
+ let box=sprite||null;
+ const tooSmall=Boolean(sprite&&sprite.tooSmall);
  if(card&&!box){
   // カードは見えたが絵を切り出せないときは、カード上端からの相対位置で拾う
   const top=card.top;
@@ -141,6 +209,8 @@ async function icon(url){
   circle=w>=10&&w<=18&&Math.abs(w-h)<=2&&bands(true)===4&&bands(false)===4;
  }
  if(!box)return {circle,ranking:[],confident:false,reason:'アイコンを切り出せません'};
+ // 断片しか取れていない絵は、似た種族に1票を投じて誤認の元になる。照合そのものを行わない。
+ if(tooSmall)return {circle,ranking:[],confident:false,reason:'アイコンの絵を十分に切り出せないため照合しません'};
  const fp=iconPixels(c,box);
  const key=btoa(String.fromCharCode(...fp));
  let learned={};try{learned=JSON.parse(localStorage.iconLabels||'{}')}catch{}
@@ -152,9 +222,9 @@ async function icon(url){
  if(learnedList[0]?.[1]<9)return {circle,name:learnedList[0][0],key,confident:true,ranking:[{name:learnedList[0][0],distance:learnedList[0][1],gap:99}]};
  const ranking=rankIconPixels(fp);
  const best=ranking[0];
- if(!best)return {circle,key,ranking,confident:false,reason:'種族の照合先がありません'};
+ if(!best)return {circle,key,ranking,confident:false,reason:'種族の照合先がありません',box};
  const confident=Boolean(best.distance<26&&best.gap>5&&!best.ambiguous);
- return {circle,key,ranking,confident,reason:confident?'':'似た種族との区別がつきません',name:best.distance<45?best.name:null};
+ return {circle,key,ranking,confident,reason:confident?'':'似た種族との区別がつきません',name:best.distance<45?best.name:null,box,iconTooSmall:tooSmall,usedFallback:!sprite&&!!box};
 }
 // 種族はアイコンから決める。アイコンの候補が僅差のときだけ、画面から読めた
 // メインスキル・食材を「どちららしいか」の手がかりに使う（値を埋めるのには使わない）。
@@ -182,14 +252,14 @@ function pickSpecies(match,r){
  // 画面のメインスキル・食材と合う種族が別にいるなら、そちらを採る（要確認つき）。
  // 例: 白くて丸い種族が密集しているため、トゲデマルがアブリーへ転びやすい。
  if(estimate&&estimateScore>=2&&estimateScore>bestScore&&(best.distance>26||best.gap<8))return {name:estimate,confident:false};
- if(best.distance<=26&&best.gap>=5)return {name:best.name,confident:true};
- if(best.distance<=40&&bestScore>=3)return {name:best.name,confident:true};
- if(estimate&&estimateScore>=3)return {name:estimate,confident:false};
- // アイコンが名前パネルに隠れて照合できない（距離が遠い）ときは、メインスキル・
- // おてつだい時間・所持数から推定した種族を使う。食材を「推定」で埋める判断にも使うため、
- // 確信ありにはしない。
- if(estimate&&estimateScore>=2&&best.distance>42)return {name:estimate,confident:false};
- if(best.distance<=42)return {name:best.name,confident:false};
+ // v2.5: アイコンだけで確定できるのは「距離が十分近く、2位と十分離れている」とき。
+ if(best.distance<=26&&best.gap>=8)return {name:best.name,confident:true};
+ // アイコンがやや遠くても、画面のメインスキル・食材が合っていれば確定してよい。
+ if(best.distance<=34&&bestScore>=3&&best.gap>=3)return {name:best.name,confident:true};
+ if(estimate&&estimateScore>=2)return {name:estimate,confident:false};
+ // かつて 1206px PNG で アブリー（距離25・差0.9）を確定採用し、食材まで あまいミツ に
+ // なった。画面の文字と合わないアイコン単独の候補は、値を入れずに未確定にする。
+ if(bestScore>=3&&best.distance<=42)return {name:best.name,confident:false};
  return {name:'',confident:false};
 }
 // 種族の候補食材と違う食材が読めたときは、値を入れずに未確定へ戻す（矛盾の検出だけに使う）。
@@ -211,8 +281,11 @@ function reconcileFoods(foods,match){
 // - 種族が分かっていて、その枠の候補が1つだけ → その食材（画像が強く矛盾するときは入れない）
 // - 候補が複数 → 画像のスコアがいちばん高い候補（0.50以上）を採用
 // - 種族が分からない → 画像の1位がはっきりしている（0.68以上・2位と0.04以上）ときだけ採用
-function suggestFoods(foodList,matchList,species){
+function suggestFoods(foodList,matchList,species,hint){
  const mon=species.name?db.mons.find(m=>m.name===species.name):null;
+ // hint は読み取り側（reader）が「同じ種族」と判断したときに返す、食材×個数の照合結果。
+ // 種族が食い違うときは使わない（推測を重ねない）。
+ const hinted=Array.isArray(hint)?hint:null;
  const foods=[],origins=[];
  for(let i=0;i<3;i++){
   const read=foodList?.[i]||'';
@@ -223,10 +296,35 @@ function suggestFoods(foodList,matchList,species){
   if(read){foods.push(read);origins.push('read');continue}
   if(allowed.length){
    const bestAllowed=allowed.map(name=>({name,score:scoreOf(name)})).sort((left,right)=>right.score-left.score)[0];
+   // 個数まで一致する候補があれば、薄いアイコンのスコアより優先する。
+   // ただし画像が別の食材をはっきり指しているときは入れない。
+   const numHit=hinted?.[i];
+   // (a) 繰り返しの食材: 食材枠は「1枠目⊂2枠目⊂3枠目」なので、前の枠で決まった食材が
+   // この枠にもう一度出ることが多い。画像が決めきれない（1位が0.72未満）とき、
+   // 前の枠と同じ食材が0.10以内の差で候補にあるなら、その繰り返しを採る。
+   // 例: 薄く描かれたLv60枠の「ピュアなオイル x7」が「ほっこりポテト」に負ける。
+   if(allowed.length>1&&(!top||top.score<0.72)){
+    // 候補が1つしかない枠（例: 1枠目がその種族で唯一の食材）は、画像のスコアに頼らず決まる。
+    // その確かな食材がこの枠の候補にもあり、1位と0.10以内なら繰り返しを採る。
+    const earlier=foods.slice(0,i).map((name,slot)=>({name,slot}))
+      .filter(item=>item.name&&allowed.includes(item.name)&&scoreOf(item.name)>0&&((top?.score??0)-scoreOf(item.name))<=0.12);
+    // 基準にするのは「単一候補の枠」で決まった食材だけ（画像の当て推量を重ねない）
+    const certain=earlier.filter(item=>((mon?.foodSlots?.[item.slot]||mon?.foods||[]).length===1));
+    const pick=certain.sort((left,right)=>scoreOf(right.name)-scoreOf(left.name))[0];
+    if(pick){foods.push(pick.name);origins.push('estimated');continue}
+   }
+   // (b) 個数（x2 / x7）まで一致する候補
+   if(numHit&&numHit.numMatched&&allowed.includes(numHit.name)&&(numHit.score>=0.60||numHit.name===top?.name)){
+    const blocked=!!top&&top.name!==numHit.name&&top.score>=0.70&&(top.score-scoreOf(numHit.name))>=0.10;
+    if(!blocked){foods.push(numHit.name);origins.push('estimated');continue}
+   }
    if(allowed.length===1){
     // 画像が別の食材をはっきり指しているときは入れない（画像と図鑑の食い違いを誤入力にしない）
     const blocked=!!top&&top.name!==allowed[0]&&top.score>=0.70&&(top.score-scoreOf(allowed[0]))>=0.10;
     if(!blocked){foods.push(allowed[0]);origins.push('estimated');continue}
+   }else if(allowed.length>1&&top&&!allowed.includes(top.name)&&bestAllowed.score<0.60){
+    // 画像の1位が候補に無く、候補の中も0.60未満＝判断材料が弱い。ここで勘で埋めると
+    // 「静かな誤入力」になるので、未確定のままにする（1枠目のような単一候補は除く）。
    }else if(bestAllowed.score>=0.50){
     foods.push(bestAllowed.name);origins.push('estimated');continue
    }
@@ -280,7 +378,9 @@ function add(file,url,match,r,id,draft={}){
  const reconciled=reconcileFoods(r.foodList||[],species);
  // 読めなかった食材は、種族の候補と画像のスコアから「可能性が高い」値で補う。
  // 補った値は「推定」として印を付け、画像で確定した値と区別する（手で直せば消える）。
- const suggested=suggestFoods(reconciled.foods,r.foodCandidates,species);
+ // 種族が決まったので、食材×個数（x2 / x7）を種族側で突き合わせ直す。
+ const foodHint=species.name?reader.suggestFoodList(species.name):null;
+ const suggested=suggestFoods(reconciled.foods,r.foodCandidates,species,foodHint);
  const rawVals=[fixCircleMark(r.name,match.circle,r.nameMark),species.name,r.lv,r.mainSkillLv,
   ...suggested.foods,
   r.mainSkillName,r.nature,...Array.from({length:5},(_,i)=>r.subSkillList?.[i])];
@@ -344,7 +444,7 @@ async function run(files){
  const entry=await add(file,url,{...match,...species},r,'shot-'+sha,{preview,sha});
  shaIndex.set(sha,entry.id);
  await entry.persist().catch(error=>{message('保存できませんでした。'+error.message)});
- if(DEBUG)window.__scanDebug.push({file:file.name,sha,match:{name:match.name,confident:match.confident,circle:match.circle,reason:match.reason,ranking:(match.ranking||[]).slice(0,4)},result:{name:r.name,lv:r.lv,mainSkillName:r.mainSkillName,mainSkillLv:r.mainSkillLv,foodList:r.foodList,subSkillList:r.subSkillList,nature:r.nature,pokemonName:r.pokemonName,warnings:reconciled.warnings},debug:r.debug||null,values:entry.controls.map(c=>c.value)});
+ if(DEBUG)window.__scanDebug.push({file:file.name,sha,match:{name:match.name,confident:match.confident,circle:match.circle,reason:match.reason,ranking:(match.ranking||[]).slice(0,4),box:match.box||null,iconTooSmall:!!match.iconTooSmall,usedFallback:!!match.usedFallback},result:{name:r.name,lv:r.lv,mainSkillName:r.mainSkillName,mainSkillLv:r.mainSkillLv,foodList:r.foodList,foodNumberList:r.foodNumberList,foodSuggestionList:r.foodSuggestionList,subSkillList:r.subSkillList,nature:r.nature,natureScore:r.natureScore,pokemonName:r.pokemonName,warnings:reconciled.warnings},debug:r.debug||null,values:entry.controls.map(c=>c.value)});
  }
  $('status').textContent=(entries.length>before?(entries.length-before)+'匹を追加。':'追加はありませんでした。')+(entries.length?'合計 '+entries.length+'匹。項目をタップすると修正できます。':'')+(rejected.length?' ／ 除外 '+rejected.length+'枚：'+rejected.join('、'):'');$('files').disabled=false;$('copy').disabled=$('save').disabled=false;$('files').value='';
 }

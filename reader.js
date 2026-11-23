@@ -5379,6 +5379,12 @@ function parseBag(rawText) {
   for (const bag of bagList) countMap.set(bag, (countMap.get(bag) ?? 0) + 1);
   return bagList.toSorted((left, right) => (countMap.get(right) ?? 0) - (countMap.get(left) ?? 0))[0];
 }
+// 性格の「手伝いスピード」補正。上げ=0.9倍、下げ=1.075倍、無関係=1倍。
+function getNatureSpeedMultiplier(natureName) {
+  const nature = natureName ? nature_default.map[natureName] : null;
+  if (!nature) return null;
+  return nature.good == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 0.9 : nature.weak == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 1.075 : 1;
+}
 function getExpectedHelpTimeList(pokemon, lv, subSkillList, natureName) {
   if (lv == null) return [];
   const enableSubSkillList = getEnableSubSkillList(lv, subSkillList);
@@ -5386,12 +5392,18 @@ function getExpectedHelpTimeList(pokemon, lv, subSkillList, natureName) {
   if (enableSubSkillList.includes("\u304A\u3066\u3064\u3060\u3044\u30B9\u30D4\u30FC\u30C9S")) speedBonus += 0.07;
   if (enableSubSkillList.includes("\u304A\u3066\u3064\u3060\u3044\u30B9\u30D4\u30FC\u30C9M")) speedBonus += 0.14;
   speedBonus = Math.min(speedBonus, 0.35);
-  const nature = natureName ? nature_default.map[natureName] : null;
-  const baseTime = Math.floor(
-    pokemon.help * (1 - (lv - 1) * 2e-3) * (1 - speedBonus) * (nature?.good == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 0.9 : nature?.weak == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 1.075 : 1)
-  );
+  // v2.5: せいかくが読めない（null）ときは、25種すべての性格補正で計算し、
+  // いちばん近いものを採る。性格1行の読み取り失敗が種族の推定ごと壊していたため。
+  const knownMultiplier = getNatureSpeedMultiplier(natureName);
+  const multiplierList = knownMultiplier != null
+    ? [knownMultiplier]
+    : [...new Set(nature_default.list.map((nature) => nature.good == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 0.9 : nature.weak == "\u624B\u4F1D\u3044\u30B9\u30D4\u30FC\u30C9" ? 1.075 : 1))];
   const ribbonRateList = pokemon.remainEvolveLv == 1 ? [1, 0.95, 0.95 * 0.88] : pokemon.remainEvolveLv == 2 ? [1, 0.89, 0.89 * 0.75] : [1];
-  return [...new Set(ribbonRateList.map((rate) => Math.floor(baseTime * rate)))];
+  const timeList = multiplierList.flatMap((multiplier) => {
+    const baseTime = Math.floor(pokemon.help * (1 - (lv - 1) * 2e-3) * (1 - speedBonus) * multiplier);
+    return ribbonRateList.map((rate) => Math.floor(baseTime * rate));
+  });
+  return [...new Set(timeList)];
 }
 function getExpectedBagList(pokemon, lv, subSkillList) {
   const enableSubSkillList = getEnableSubSkillList(lv, subSkillList);
@@ -5482,18 +5494,33 @@ function correctResult(result, foodRecognitionList, iconName) {
   // （名前の表記揺れ・レベルの丸め・食材の補完は v2.1 までの挙動で、誤確定の元だった）
   const pokemon = pokemon_default.map[iconName ?? ""] ?? estimatePokemon(result, foodRecognitionList);
   if (!pokemon) return result;
+  // v2.5: 食材の「候補」と「個数」を種族側で突き合わせた結果も返す。
+  // 薄く描かれた未解放の食材（例: Lv60 のピュアなオイル x7）は画像のスコアが
+  // 低く、同じ枠で別の食材に負けることがある。個数まで一致する候補は
+  // 画像スコアより確かな手がかりになるため、アプリ側の補完で使う。
+  const foodSuggestionList = foodRecognitionList.map((recognition, slotIndex) => {
+    const match = getAllowedFoodMatch(pokemon, recognition, slotIndex);
+    if (!match) return null;
+    return {
+      name: match.name,
+      score: Math.round(match.score * 1000) / 1000,
+      numMatched: recognition.num != null && pokemon.foodNumListMap[match.name]?.[slotIndex] == recognition.num
+    };
+  });
   return {
     ...result,
     name: result.name,
     lv: result.lv,
     pokemonName: pokemon.name,
     foodList: result.foodList.map((food) => food ?? null),
+    foodNumberList: foodRecognitionList.map((food) => food.num ?? null),
+    foodSuggestionList,
     subSkillList: result.subSkillList,
     mainSkillName: result.mainSkillName,
     warnings: result.warnings ?? []
   };
 }
-function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList, subSkillPillNameList = null, nameCard = null, levelArea = null, nameFix = null) {
+function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLineList = lineList, sourceCoordinateLineList = lineList, subSkillPillNameList = null, nameCard = null, levelArea = null, nameFix = null, naturePillLineList = null) {
   const normalizedRawText = normalizeText(rawText);
   // 個体レベルは名前パネルの中の「Lv.NN」だけ。サブスキルの解放レベル（Lv.50 など）や
   // 食材の Lv.30/60 を拾わないよう、読む範囲を名前パネルの帯に限る。
@@ -5542,7 +5569,15 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
   const pillNameList = (subSkillPillNameList ?? []).slice(0, 5);
   const pillCount = pillNameList.filter((name) => name != null).length;
   const subSkillList = pillCount >= 1 ? pillNameList : subSkillLineNameList;
-  const nature = nature_default.list.map((item) => ({ name: item.name, match: findBestLine(item.name, lineList) })).toSorted((a, b) => b.match.score - a.match.score)[0];
+  // v2.5: せいかくは性格名25種だけを候補にする。絶対しきい値0.65に加えて、
+  // 「1位が0.55以上、かつ2位と0.15以上はなれている」ときも採用する
+  // （「おくびぴびょう」→ おくびょう が類似度0.6で落ちていた）。
+  // 緑の「せいかく」ピルを単独で読み直した行があれば、それを候補に混ぜる。
+  const natureLineList = naturePillLineList && naturePillLineList.length ? [...lineList, ...naturePillLineList] : lineList;
+  const natureRankList = nature_default.list.map((item) => ({ name: item.name, match: findBestLine(item.name, natureLineList) })).toSorted((a, b) => b.match.score - a.match.score);
+  const nature = natureRankList[0];
+  const natureRunnerUpScore = natureRankList[1]?.match.score ?? 0;
+  const isNatureAccepted = Boolean(nature?.match) && (nature.match.score >= 0.65 || (nature.match.score >= 0.55 && nature.match.score - natureRunnerUpScore >= 0.15));
   // 字形の数よりOCRの文字が多いときは、末尾の記号の手前に入った余分なひらがなを削る。
   let fixedName = parsedName;
   if (nameFix) {
@@ -5559,11 +5594,15 @@ function parseData(iconName, rawText, lineList, foodRecognitionList, primaryLine
     bag: parseBag(rawText),
     foodList: foodRecognitionList.map((food) => food.name),
     // 食材の照合スコア（候補と点）。種族の候補食材と突き合わせて「推定で埋める」判断に使う。
-    foodCandidates: foodRecognitionList.map((food) => (food.matchList ?? []).slice(0, 5).map((match) => ({ name: match.name, score: match.score }))),
+    // 候補は広めに返す（アプリ側が「同じ食材の繰り返し」を照合するときに、
+    // 薄いアイコンで5位より下にいる正解も見るため）
+    foodCandidates: foodRecognitionList.map((food) => (food.matchList ?? []).slice(0, 12).map((match) => ({ name: match.name, score: match.score }))),
     mainSkillName: mainSkill?.match.score >= 0.65 ? mainSkill.name : null,
     mainSkillLv,
     subSkillList,
-    nature: nature?.match && nature.match.score >= 0.65 ? nature.name : null,
+    nature: isNatureAccepted ? nature.name : null,
+    natureScore: nature?.match ? Math.round(nature.match.score * 1000) / 1000 : null,
+    natureRunnerUpScore: Math.round(natureRunnerUpScore * 1000) / 1000,
     rawText
   };
   return correctResult(result, foodRecognitionList, iconName);
@@ -5680,6 +5719,45 @@ function findGreenOutlineRegions(sourceCanvas) {
     startY = endY + 1;
   }
   return regionList;
+}
+// 詳細ステータスの「せいかく」は緑の枠のピルに1行で出る。全体OCRでは
+// 「おくびぴびょう」のように1文字崩れることがあり、その1文字が種族の推定まで
+// 巻き込んでいた（v2.4 の連鎖）。ピルの帯だけを切り出して単独行として読み直し、
+// 性格名の照合にだけ使う。
+async function recognizeNaturePillLineList(sourceCanvas, worker, regionList) {
+  const candidates = regionList
+    .filter((region) => region.width <= sourceCanvas.width * 0.62 && region.height >= 40 && region.height <= Math.round(sourceCanvas.height * 0.16))
+    .toSorted((left, right) => right.y + right.height - (left.y + left.height));
+  const region = candidates[0];
+  if (!region) return [];
+  // 緑の枠と「せいかく」の見出しを外し、ピルの中の値だけを切り出す
+  const innerX = region.x + region.width * 0.09;
+  const innerY = region.y + region.height * 0.30;
+  const innerW = Math.max(24, region.width * 0.80);
+  const innerH = Math.max(18, region.height * 0.56);
+  const scale = Math.min(5, Math.max(2, 900 / Math.max(innerW, 1)));
+  const crop = createCanvas(Math.ceil(innerW * scale), Math.ceil(innerH * scale));
+  const context = crop.getContext("2d");
+  context.fillStyle = "#fff";
+  context.fillRect(0, 0, crop.width, crop.height);
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.drawImage(sourceCanvas, innerX, innerY, innerW, innerH, 0, 0, crop.width, crop.height);
+  // 拡大しただけだと緑の帯と白の地でコントラストが足りない。文字だけの2値画像にしてから読む。
+  const canvas = createTextCanvas(crop, true);
+  await worker.setParameters({
+    tessedit_pageseg_mode: import_tesseract.default.PSM.SINGLE_BLOCK,
+    preserve_interword_spaces: "1"
+  });
+  try {
+    const result = await worker.recognize(canvas, {}, { text: true, blocks: true });
+    return flattenLines(result.data.blocks);
+  } finally {
+    await worker.setParameters({
+      tessedit_pageseg_mode: import_tesseract.default.PSM.SPARSE_TEXT,
+      preserve_interword_spaces: "1"
+    });
+  }
 }
 function createSourceCoordinateRegionCanvas(sourceCanvas, regionList) {
   if (!regionList.length) return null;
@@ -6299,7 +6377,9 @@ async function recognizeFoodList(sourceCanvas) {
       name: accepted ? best.name : null,
       num: null,
       region: { x: box.cx - box.side / 2, y: box.cy - box.side / 2, width: box.side, height: box.side },
-      matchList: rankedList.slice(0, 5).map((item) => ({ name: item.name, score: item.score })),
+      // 候補は全部返す（アプリ側が「同じ食材の繰り返し」を照合するのに使う。
+      // 薄いアイコンでは1位が数点しか離れておらず、5位より下に正解がいることがある）
+      matchList: rankedList.map((item) => ({ name: item.name, score: item.score })),
       empty: !best || best.score < 0.2,
       reason: accepted ? "image-matched" : "low-confidence",
       rejected: accepted ? null : {
@@ -6873,6 +6953,7 @@ function parseNameCardText(text) {
 var PokemonStatusImageReader = class {
   #worker = null;
   #debug = false;
+  #lastFoodRecognitionList = null;
   async #getWorker(onProgress) {
     if (this.#worker) return this.#worker;
     const ocrAssetPath = new URL('./ocr', import.meta.url).href.replace(/\/$/, "");
@@ -6912,6 +6993,7 @@ var PokemonStatusImageReader = class {
     const outlinedLineList = flattenLines(outlinedRegionResult?.data.blocks ?? null);
     setSubSkillRarity(outlinedLineList, sourceCanvas);
     setFoodNumberList(foodList, [...primaryLineList, ...binaryLineList, ...outlinedLineList]);
+    this.#lastFoodRecognitionList = foodList;
     const foodNumberCanvas = createFoodNumberCanvas(sourceCanvas, foodList);
     if (foodNumberCanvas) {
       await worker.setParameters({
@@ -6937,6 +7019,8 @@ ${outlinedRegionResult?.data.text ?? ""}`;
     // サブスキルは小さく淡い文字が並び、全体OCRの行だけでは取りこぼす。
     // ピル単位で読み取った並び（Lv10→Lv80の位置順）を、Lvや最大所持数の補正より先に渡す。
     const subSkillPillNameList = await recognizeSubSkillNameList(sourceCanvas, worker);
+    // v2.5: せいかくのピルだけを単独行として読み直す（全体OCRの1文字崩れ対策）
+    const naturePillLineList = await recognizeNaturePillLineList(sourceCanvas, worker, greenOutlineRegionList);
     // 名前パネルは固定カード。時計や SP、食材のレベルが混ざらないここだけから読む。
     let nameCard = null;
     let nameCardText = null;
@@ -6985,7 +7069,7 @@ ${outlinedRegionResult?.data.text ?? ""}`;
         }
       }
     }
-    const result = parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList, subSkillPillNameList, nameCard ?? undefined, levelArea, nameFix);
+    const result = parseData(iconName, rawText, lineList, foodList, primaryLineList, lineList, subSkillPillNameList, nameCard ?? undefined, levelArea, nameFix, naturePillLineList);
     if (this.debug) {
       result.debug = {
         sourceWidth: image.naturalWidth,
@@ -7005,6 +7089,8 @@ ${outlinedRegionResult?.data.text ?? ""}`;
           rejected: food.rejected ?? null
         })),
         subSkillPillNameList,
+        naturePillLineList,
+        naturePillText: naturePillLineList.map((line) => line.text).join(" / "),
         subSkillPillRegionList: (findSubSkillPillRegionList(sourceCanvas, findSubSkillBand(sourceCanvas)) ?? []).map((region) => ({ slot: region.slot, x: Math.round(region.x), y: Math.round(region.y), width: Math.round(region.width), height: Math.round(region.height) })),
         warnings: result.warnings ?? []
       };
@@ -7026,6 +7112,22 @@ ${outlinedRegionResult?.data.text ?? ""}`;
     } finally {
       await worker.setParameters(previous);
     }
+  }
+  // アプリ側で種族が決まったあとに、食材×個数の突き合わせをやり直す（v2.5）。
+  // 画面の絵は薄く描かれた未解放の食材を読み違えることがあり、個数（x2 / x7）まで
+  // 一致する候補のほうが確かな手がかりになる。
+  suggestFoodList(pokemonName) {
+    const pokemon = pokemon_default.map[pokemonName ?? ""];
+    if (!pokemon || !this.#lastFoodRecognitionList) return null;
+    return this.#lastFoodRecognitionList.map((recognition, slotIndex) => {
+      const match = getAllowedFoodMatch(pokemon, recognition, slotIndex);
+      if (!match) return null;
+      return {
+        name: match.name,
+        score: Math.round(match.score * 1000) / 1000,
+        numMatched: recognition.num != null && pokemon.foodNumListMap[match.name]?.[slotIndex] == recognition.num
+      };
+    });
   }
   get debug() {
     return this.#debug;
@@ -7053,12 +7155,21 @@ if (typeof window !== "undefined" && /(^|[?&])debug=1(&|$)/.test(location.search
     recognizeFoodList,
     matchFoodSlot,
     foodSlotBoxes,
+    findFoodCircleRegions,
     foodCreamColor,
     foodTemplateList,
     isAllowedFood,
     pokemon_default,
     Food,
-    sub_skill_default
+    sub_skill_default,
+    nature_default,
+    findNameCardBox,
+    findGreenOutlineRegions,
+    getExpectedHelpTimeList,
+    getNatureSpeedMultiplier,
+    estimatePokemon,
+    parseHelpTime,
+    getTextSimilarity
   };
 }
 export {
