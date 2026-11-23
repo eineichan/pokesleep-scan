@@ -5973,105 +5973,339 @@ function createUnblendedFoodCanvas(sourceCanvas, region, background, alpha) {
   context.putImageData(imageData, 0, 0);
   return canvas;
 }
-async function recognizeFoodList(sourceCanvas) {
-  const slotList = selectFoodSlotRegions(findFoodCircleRegions(sourceCanvas));
-  if (!slotList.length) return [];
-  const templateList = await Promise.all(Food.list.map(async (food) => {
-    const image = await loadImage(food.img);
-    const canvas = drawImageToCanvas(image, image.naturalWidth, image.naturalHeight);
-    return {
-      name: food.name,
-      histogram: createColorHistogram(canvas, void 0, true),
-      pixels: createNormalizedPixels(canvas, void 0, true),
-      lowerPixels: createNormalizedPixels(canvas, void 0, true, 0.62)
+// --- 食材アイコンの照合（v2.3） ----------------------------------------------
+// v2.2 までの照合は、見本画像に写っているタイル背景（茶色のひし形）まで色の比較に
+// 入れていたため、茶色い食材（カカオ・マメミートなど）に引っ張られていた。
+// v2.3 では見本からタイル背景を除いた「アイコンの絵だけ」を比べる。
+// 未解放のアイコンは (1) 小さく描かれ (2) クリーム色の円に薄く重ねられるので、
+// 大きさ・位置のズレ・濃さ（alpha）を1枠ずつ探し、
+//   観測 = alpha * 見本 + (1 - alpha) * 円の色
+// でどれだけ説明できるかで順位を付ける。種族の候補食材は照合に使わない。
+const FOOD_GRID = 40;          // 照合に使う縮小グリッド（40x40）
+const FOOD_REFERENCE_SIDE = 128; // スロットの円の基準サイズ（見本は 150 の正方形）
+// よく一致して、2位と差があるときだけ値を入れる。少しでも迷ったら空欄。
+const FOOD_ACCEPT_SCORE = 0.80;
+const FOOD_ACCEPT_GAP = 0.04;
+const FOOD_TEMPLATE_CACHE = { promise: null };
+
+// 食材スロット3つの位置を、円の検出結果から決める。
+// 名前パネルに隠れて円が欠けている枠は、隣の枠の間隔から位置を外挿する。
+function foodSlotBoxes(sourceCanvas) {
+  const regionList = findFoodCircleRegions(sourceCanvas);
+  if (!regionList.length) return [];
+  const sizeOf = (region) => Math.max(region.width, region.height);
+  const centerY = (region) => region.y + region.height / 2;
+  const centerX = (region) => region.x + region.width / 2;
+  const rowList = [];
+  for (const region of regionList.toSorted((left, right) => centerY(left) - centerY(right))) {
+    const cy = centerY(region);
+    const row = rowList.find((item) => Math.abs(cy - item.cy) <= Math.max(6, sizeOf(region) * 0.28));
+    if (row) {
+      row.list.push(region);
+      row.cy = row.list.reduce((sum, item) => sum + centerY(item), 0) / row.list.length;
+    } else {
+      rowList.push({ cy, list: [region] });
+    }
+  }
+  const row = rowList.toSorted((left, right) => right.list.length - left.list.length || right.list.reduce((sum, item) => sum + sizeOf(item), 0) - left.list.reduce((sum, item) => sum + sizeOf(item), 0))[0];
+  if (!row || row.list.length < 1) return [];
+  const side = Math.max(...row.list.map(sizeOf));
+  // アイコンに円が割られて断片になることがあるので、中心が近いものは同じ枠にまとめる
+  const clusterList = [];
+  for (const region of row.list.toSorted((left, right) => centerX(left) - centerX(right))) {
+    const cx = centerX(region);
+    const last = clusterList.at(-1);
+    if (last && Math.abs(cx - last.cx) <= side * 0.6) {
+      last.itemList.push(region);
+      last.cx = (last.cx * (last.itemList.length - 1) + cx) / last.itemList.length;
+    } else {
+      clusterList.push({ cx, itemList: [region] });
+    }
+  }
+  let cxList = clusterList.map((cluster) => cluster.cx);
+  if (cxList.length > 3) {
+    // 4つ以上に見えるときは、間隔がいちばん揃う3つを選ぶ
+    let best = null;
+    for (let index = 0; index + 2 < cxList.length; index++) {
+      const first = cxList[index + 1] - cxList[index];
+      const second = cxList[index + 2] - cxList[index + 1];
+      const error = Math.abs(first - second);
+      if (!best || error < best.error) best = { error, list: cxList.slice(index, index + 3) };
+    }
+    if (best) cxList = best.list;
+  }
+  const gapList = cxList.slice(1).map((cx, index) => cx - cxList[index]);
+  const interval = gapList.length ? gapList.toSorted((left, right) => left - right)[Math.floor(gapList.length / 2)] : side * 1.2;
+  if (!gapList.length || interval <= 0) return [];
+  const boxList = cxList.map((cx) => ({ cx, cy: row.cy, side, interval }));
+  if (boxList.length === 2) {
+    boxList.unshift({ cx: cxList[0] - interval, cy: row.cy, side, interval, synthesized: true });
+  }
+  if (boxList.length >= 3) {
+    // 左端の枠は名前パネルに隠れやすい。位置が間隔からずれていたら外挿し直す。
+    if (Math.abs(boxList[0].cx - (boxList[1].cx - interval)) > interval * 0.25) boxList[0] = { ...boxList[0], cx: boxList[1].cx - interval, synthesized: true };
+    if (Math.abs(boxList[2].cx - (boxList[1].cx + interval)) > interval * 0.25) boxList[2] = { ...boxList[2], cx: boxList[1].cx + interval, synthesized: true };
+  }
+  return boxList.slice(0, 3);
+}
+
+// スロットの円の色（クリーム）。名前パネルの白とは、青の値で区別する。
+function foodCreamColor(sourceCanvas, boxList) {
+  const bins = new Map();
+  for (const box of boxList) {
+    const size = 96;
+    const canvas = createCanvas(size, size);
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    context.drawImage(sourceCanvas, box.cx - box.side / 2, box.cy - box.side / 2, box.side, box.side, 0, 0, size, size);
+    const { data } = context.getImageData(0, 0, size, size);
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (Math.hypot((x - size / 2 + 0.5) / size, (y - size / 2 + 0.5) / size) > 0.40) continue;
+        const index = (y * size + x) * 4;
+        const red = data[index] / 255;
+        const green = data[index + 1] / 255;
+        const blue = data[index + 2] / 255;
+        const chroma = Math.max(red, green, blue) - Math.min(red, green, blue);
+        const luminance = 0.299 * red + 0.587 * green + 0.114 * blue;
+        if (chroma > 0.09 || chroma < 0.01 || luminance < 0.88 || blue > 0.975) continue;
+        const key = `${data[index]},${data[index + 1]},${data[index + 2]}`;
+        bins.set(key, (bins.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  let best = null;
+  let bestCount = -1;
+  for (const [key, count] of bins) if (count > bestCount) { bestCount = count; best = key; }
+  const [red, green, blue] = (best ?? "253,254,240").split(",").map(Number);
+  return { red: red / 255, green: green / 255, blue: blue / 255 };
+}
+
+function sampleFoodGrid(sourceCanvas, centerX, centerY, side, size) {
+  const canvas = createCanvas(size, size);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.imageSmoothingEnabled = true;
+  context.drawImage(sourceCanvas, centerX - side / 2, centerY - side / 2, side, side, 0, 0, size, size);
+  const { data } = context.getImageData(0, 0, size, size);
+  const pixelList = new Array(size * size);
+  for (let index = 0; index < size * size; index++) {
+    pixelList[index] = {
+      red: data[index * 4] / 255,
+      green: data[index * 4 + 1] / 255,
+      blue: data[index * 4 + 2] / 255,
+      alpha: data[index * 4 + 3] / 255
     };
-  }));
-  return slotList.map((region) => {
-    const histogram = createColorHistogram(sourceCanvas, region);
-    const pixels = createNormalizedPixels(sourceCanvas, region, false, region.occluded ? 0.62 : 0);
-    const foregroundPixels = pixels.filter((pixel) => pixel.foreground);
-    const sourceChroma = foregroundPixels.reduce(
-      (sum, pixel) => sum + Math.max(pixel.red, pixel.green, pixel.blue) - Math.min(pixel.red, pixel.green, pixel.blue),
-      0
-    ) / Math.max(1, foregroundPixels.length);
-    const matchList = templateList.map((template) => {
-      const histogramScore = cosineSimilarity(histogram, template.histogram);
-      const pixelScore = getPixelSimilarity(pixels, region.occluded ? template.lowerPixels : template.pixels);
-      return {
-        name: template.name,
-        score: region.occluded ? pixelScore : template.name == "\u3068\u304F\u305B\u3093\u30A8\u30C3\u30B0" ? Math.max(histogramScore * 0.35 + pixelScore * 0.65, histogramScore * 0.1 + pixelScore * 0.9) + 0.01 + (sourceChroma < 0.18 ? 0.08 : 0) : histogramScore * 0.35 + pixelScore * 0.65
-      };
-    }).toSorted((a, b) => b.score - a.score);
-    // 2つ目の見方: 淡い円を背景として濃さを戻した画像でも照合する。
-    const circleScores = new Map();
-    const circleInfo = findFoodCircleBackground(sourceCanvas, region);
-    if (circleInfo) {
-      for (const alpha of [0.25, 0.35, 0.45, 0.6]) {
-        const canvas = createUnblendedFoodCanvas(sourceCanvas, circleInfo.region, circleInfo.background, alpha);
-        if (!canvas) continue;
-        const circleHistogram = createColorHistogram(canvas);
-        const circlePixels = createNormalizedPixels(canvas);
-        for (const template of templateList) {
-          const score = cosineSimilarity(circleHistogram, template.histogram) * 0.35 + getPixelSimilarity(circlePixels, template.pixels) * 0.65;
-          const previous = circleScores.get(template.name);
-          if (!previous || score > previous) circleScores.set(template.name, score);
+  }
+  return pixelList;
+}
+
+// 見本画像（150x150）からタイル背景を除いたアイコンの絵を作る。
+async function foodTemplateList() {
+  if (!FOOD_TEMPLATE_CACHE.promise) {
+    FOOD_TEMPLATE_CACHE.promise = (async () => {
+      const list = [];
+      for (const food of Food.list) {
+        const image = await loadImage(food.img);
+        const width = image.naturalWidth;
+        const height = image.naturalHeight;
+        const canvas = drawImageToCanvas(image, width, height);
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        const { data } = context.getImageData(0, 0, canvas.width, canvas.height);
+        const opaqueList = [];
+        const bins = new Map();
+        for (let index = 0; index < canvas.width * canvas.height; index++) {
+          if (data[index * 4 + 3] < 230) continue;
+          const red = data[index * 4];
+          const green = data[index * 4 + 1];
+          const blue = data[index * 4 + 2];
+          opaqueList.push(index);
+          const key = `${(red >> 3) << 10 | (green >> 3) << 5 | blue >> 3}`;
+          bins.set(key, (bins.get(key) ?? 0) + 1);
         }
+        // タイル背景は「大きな面積を占める平らな色」。1〜3色まで拾う
+        const flatList = [];
+        for (const [key, count] of [...bins.entries()].toSorted((left, right) => right[1] - left[1])) {
+          if (count < opaqueList.length * 0.05) break;
+          flatList.push([((key >> 10) & 31) * 8 + 4, ((key >> 5) & 31) * 8 + 4, (key & 31) * 8 + 4]);
+          if (flatList.length >= 3) break;
+        }
+        const mask = new Uint8Array(canvas.width * canvas.height);
+        for (const index of opaqueList) {
+          const red = data[index * 4];
+          const green = data[index * 4 + 1];
+          const blue = data[index * 4 + 2];
+          const isFlat = flatList.some((flat) => Math.max(Math.abs(red - flat[0]), Math.abs(green - flat[1]), Math.abs(blue - flat[2])) <= 13);
+          mask[index] = isFlat ? 0 : 1;
+        }
+        // 1〜2画素だけの点は背景の残りなので落とす
+        const cleanMask = new Uint8Array(mask.length);
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            const index = y * canvas.width + x;
+            if (!mask[index]) continue;
+            let neighbours = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nextX = x + dx;
+                const nextY = y + dy;
+                if (nextX < 0 || nextY < 0 || nextX >= canvas.width || nextY >= canvas.height) continue;
+                neighbours += mask[nextY * canvas.width + nextX];
+              }
+            }
+            cleanMask[index] = neighbours >= 3 ? 1 : 0;
+          }
+        }
+        // アイコンと背景の境目は半透明で混ざっていて色が濁るため、1マス分だけ内側を比べる
+        const erodedMask = new Uint8Array(cleanMask.length);
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            const index = y * canvas.width + x;
+            if (!cleanMask[index]) continue;
+            let inner = 1;
+            for (let dy = -1; dy <= 1 && inner; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                const nextX = x + dx;
+                const nextY = y + dy;
+                if (nextX < 0 || nextY < 0 || nextX >= canvas.width || nextY >= canvas.height) { inner = 0; break; }
+                if (!cleanMask[nextY * canvas.width + nextX]) { inner = 0; break; }
+              }
+            }
+            erodedMask[index] = inner;
+          }
+        }
+        // 150x150 の全体を FOOD_GRID に縮小し、同じ割合でアイコンの範囲を写す
+        const pixelList = sampleFoodGrid(canvas, canvas.width / 2, canvas.height / 2, Math.max(canvas.width, canvas.height), FOOD_GRID);
+        const iconMask = new Uint8Array(FOOD_GRID * FOOD_GRID);
+        let iconCount = 0;
+        for (let y = 0; y < FOOD_GRID; y++) {
+          for (let x = 0; x < FOOD_GRID; x++) {
+            const sourceX = Math.min(canvas.width - 1, Math.floor((x + 0.5) * canvas.width / FOOD_GRID));
+            const sourceY = Math.min(canvas.height - 1, Math.floor((y + 0.5) * canvas.height / FOOD_GRID));
+            const on = erodedMask[sourceY * canvas.width + sourceX] ? 1 : 0;
+            iconMask[y * FOOD_GRID + x] = on;
+            iconCount += on;
+          }
+        }
+        list.push({ name: food.name, pixelList, iconMask, iconCount, side: Math.max(canvas.width, canvas.height) });
+      }
+      return list;
+    })();
+  }
+  return FOOD_TEMPLATE_CACHE.promise;
+}
+
+// 1枠を照合して、見本の名前をスコア順に返す。
+function matchFoodSlot(sourceCanvas, box, cream, templateList) {
+  const grid = FOOD_GRID;
+  const sizeScale = box.side / FOOD_REFERENCE_SIDE;
+  const scaleList = [0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 1, 1.1];
+  const offsetList = [[0, 0]];
+  for (const dy of [-5, 5, -10, 10, -15, 15]) for (const dx of [0, -6, 6]) offsetList.push([dx, dy]);
+  const gridCache = new Map();
+  const getGrid = (scale, offsetX, offsetY) => {
+    const key = `${scale},${offsetX},${offsetY}`;
+    if (gridCache.has(key)) return gridCache.get(key);
+    const side = 150 * scale * sizeScale;
+    const pixelList = sampleFoodGrid(sourceCanvas, box.cx + offsetX, box.cy + offsetY, side, grid);
+    // 円の色（クリーム）と、名前パネルの白は「背景」として0にする
+    const deviation = new Float32Array(grid * grid * 3);
+    for (let index = 0; index < pixelList.length; index++) {
+      const pixel = pixelList[index];
+      const red = pixel.red - cream.red;
+      const green = pixel.green - cream.green;
+      const blue = pixel.blue - cream.blue;
+      const magnitude = Math.abs(red) + Math.abs(green) + Math.abs(blue);
+      const keep = pixel.alpha > 0.4 && magnitude > 0.1 ? 1 : 0;
+      deviation[index * 3] = red * keep;
+      deviation[index * 3 + 1] = green * keep;
+      deviation[index * 3 + 2] = blue * keep;
+    }
+    const result = { pixelList, deviation };
+    gridCache.set(key, result);
+    return result;
+  };
+  const resultList = [];
+  for (const template of templateList) {
+    const base = template.pixelList;
+    let best = null;
+    for (const scale of scaleList) {
+      for (const [offsetX, offsetY] of offsetList) {
+        const observed = getGrid(scale, offsetX, offsetY);
+        // 1) 隠れていない所だけを使って、濃さ（alpha）を最小二乗で求める
+        let sumProduct = 0;
+        let sumSquare = 0;
+        let sampleCount = 0;
+        for (let index = 0; index < template.iconMask.length; index++) {
+          if (!template.iconMask[index]) continue;
+          const observedMagnitude = Math.abs(observed.deviation[index * 3]) + Math.abs(observed.deviation[index * 3 + 1]) + Math.abs(observed.deviation[index * 3 + 2]);
+          if (observedMagnitude <= 0.1) continue;
+          const red = base[index].red - cream.red;
+          const green = base[index].green - cream.green;
+          const blue = base[index].blue - cream.blue;
+          if (Math.abs(red) + Math.abs(green) + Math.abs(blue) < 0.06) continue;
+          sumProduct += red * observed.deviation[index * 3] + green * observed.deviation[index * 3 + 1] + blue * observed.deviation[index * 3 + 2];
+          sumSquare += red * red + green * green + blue * blue;
+          sampleCount++;
+        }
+        if (sampleCount < Math.max(16, template.iconCount * 0.06)) continue;
+        const alpha = Math.max(0.18, Math.min(1.05, sumProduct / Math.max(1e-6, sumSquare)));
+        // 2) その濃さで観測をどれだけ説明できるか
+        let difference = 0;
+        let deviationSum = 0;
+        let compared = 0;
+        for (let index = 0; index < template.iconMask.length; index++) {
+          if (!template.iconMask[index]) continue;
+          const observedMagnitude = Math.abs(observed.deviation[index * 3]) + Math.abs(observed.deviation[index * 3 + 1]) + Math.abs(observed.deviation[index * 3 + 2]);
+          if (observedMagnitude <= 0.1) continue;
+          const pixel = observed.pixelList[index];
+          const predictedRed = alpha * base[index].red + (1 - alpha) * cream.red;
+          const predictedGreen = alpha * base[index].green + (1 - alpha) * cream.green;
+          const predictedBlue = alpha * base[index].blue + (1 - alpha) * cream.blue;
+          difference += (Math.abs(pixel.red - predictedRed) + Math.abs(pixel.green - predictedGreen) + Math.abs(pixel.blue - predictedBlue)) / 3;
+          deviationSum += observedMagnitude / 3;
+          compared++;
+        }
+        if (!compared) continue;
+        const coverage = compared / Math.max(1, template.iconCount);
+        const explained = Math.max(0, 1 - (difference / compared) / (deviationSum / compared + 1e-6));
+        const score = explained * Math.min(1, coverage / 0.55);
+        if (!best || score > best.score) best = { score, alpha, scale, offsetX, offsetY, coverage };
       }
     }
-    const circleMatchList = [...circleScores.entries()].map(([name, score]) => ({ name, score })).toSorted((a, b) => b.score - a.score);
-    const bestMatch = matchList[0];
-    const normalizedSide = Math.sqrt(pixels.length);
-    const centerPixels = pixels.filter((_, index) => {
-      const x = index % normalizedSide;
-      const y = Math.floor(index / normalizedSide);
-      return x >= normalizedSide * 0.2 && x < normalizedSide * 0.8 && y >= normalizedSide * 0.2 && y < normalizedSide * 0.8;
-    });
-    const foregroundRate = centerPixels.filter((pixel) => pixel.foreground).length / centerPixels.length;
-    const coloredForegroundRate = centerPixels.filter(
-      (pixel) => pixel.foreground && Math.max(pixel.red, pixel.green, pixel.blue) - Math.min(pixel.red, pixel.green, pixel.blue) >= 0.1
-    ).length / centerPixels.length;
-    const empty = !region.occluded && (foregroundRate < 0.02 || coloredForegroundRate < 0.12);
-    const minimumScore = region.occluded ? 0.15 : 0.3;
-    // 2通りの見方（そのまま／濃さを戻す）が一致したときだけ採用する。
-    // 一致しないときは未確定にし、誤った値を入れない。
-    const baseSecond = matchList[1];
-    const baseGap = baseSecond ? bestMatch.score - baseSecond.score : 1;
-    const circleBest = circleMatchList[0];
-    const circleSecond = circleMatchList[1];
-    const circleGap = circleBest && circleSecond ? circleBest.score - circleSecond.score : 0;
-    const near = (list2, name) => (list2 ?? []).slice(0, 3).some((match) => match.name == name && match.score >= 0.5);
-    let accepted = false;
-    let reason = "no-match";
-    if (!empty && bestMatch && bestMatch.score >= minimumScore) {
-      if (circleBest && circleBest.name == bestMatch.name && bestMatch.score >= 0.55) {
-        accepted = true;
-        reason = "agree";
-      } else if (baseGap >= 0.06 && near(circleMatchList, bestMatch.name)) {
-        accepted = true;
-        reason = "clear-winner";
-      } else if (circleBest && circleBest.score >= 0.55 && circleGap >= 0.04) {
-        accepted = true;
-        bestMatch.name = circleBest.name;
-        bestMatch.score = circleBest.score;
-        reason = "clear-winner-unblended";
-      }
-    }
+    resultList.push({ name: template.name, ...(best ?? { score: 0, alpha: null, coverage: 0 }) });
+  }
+  return resultList.toSorted((left, right) => right.score - left.score);
+}
+
+async function recognizeFoodList(sourceCanvas) {
+  const boxList = foodSlotBoxes(sourceCanvas);
+  if (!boxList.length) return [];
+  const cream = foodCreamColor(sourceCanvas, boxList);
+  const templateList = await foodTemplateList();
+  return boxList.map((box) => {
+    const rankedList = matchFoodSlot(sourceCanvas, box, cream, templateList);
+    const best = rankedList[0];
+    const second = rankedList[1];
+    const gap = best && second ? best.score - second.score : 1;
+    // 迷ったときは値を入れない（誤入力を避ける）
+    const accepted = !!best && best.score >= FOOD_ACCEPT_SCORE && gap >= FOOD_ACCEPT_GAP;
     return {
-      name: accepted ? bestMatch.name : null,
+      name: accepted ? best.name : null,
       num: null,
-      region,
-      matchList: accepted ? matchList : [...matchList, ...circleMatchList.filter((match) => !matchList.some((item) => item.name == match.name))].toSorted((a, b) => b.score - a.score),
-      empty,
-      reason,
-      rejected: !accepted && !empty ? {
-        best: matchList[0]?.name ?? null,
-        score: Math.round((matchList[0]?.score ?? 0) * 1000) / 1000,
-        gap: Math.round(baseGap * 1000) / 1000,
-        unblended: circleBest ? [circleBest.name, Math.round(circleBest.score * 1000) / 1000, Math.round(circleGap * 1000) / 1000] : null
-      } : null
+      region: { x: box.cx - box.side / 2, y: box.cy - box.side / 2, width: box.side, height: box.side },
+      matchList: rankedList.slice(0, 5).map((item) => ({ name: item.name, score: item.score })),
+      empty: !best || best.score < 0.2,
+      reason: accepted ? "image-matched" : "low-confidence",
+      rejected: accepted ? null : {
+        best: best?.name ?? null,
+        score: Math.round((best?.score ?? 0) * 1000) / 1000,
+        gap: Math.round(gap * 1000) / 1000,
+        alpha: best?.alpha == null ? null : Math.round(best.alpha * 100) / 100,
+        coverage: Math.round((best?.coverage ?? 0) * 100) / 100
+      }
     };
   });
 }
+
 // --- サブスキルのピル読み取り -------------------------------------------------
 // 画面のスクロール量や端末の機種で位置がずれても読めるように、緑の見出し帯
 // （メインスキル・サブスキル / 詳細ステータス）を基準に帯を決め、その中の

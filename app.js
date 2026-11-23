@@ -1,9 +1,9 @@
-import {rankIcons} from './icon-match.js?v=20261123d';
-import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123d';
-import {detailScreenCheck} from './image-check.js?v=20261123d';
-import Reader from './reader.js?v=20261123d';
+import {rankIcons} from './icon-match.js?v=20261123e';
+import {cachedCatalog,checkCatalog} from './catalog-update.js?v=20261123e';
+import {detailScreenCheck} from './image-check.js?v=20261123e';
+import Reader from './reader.js?v=20261123e';
 const $=id=>document.getElementById(id);
-const VERSION='20261123d';
+const VERSION='20261123e';
 const DEBUG=new URLSearchParams(location.search).get('debug')==='1';
 const [bundled,encoded]=await Promise.all(['catalog.json','icon-catalog.json'].map(p=>fetch(p).then(r=>r.json())));
 let catalogStorage;try{catalogStorage=localStorage}catch{catalogStorage={getItem:()=>null,setItem:()=>{throw Error('保存不可')}}}
