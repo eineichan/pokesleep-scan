@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#eaf9ff">
+<title>📸 個体スキャン</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --aqua-50:#f2fbff; --aqua-100:#e2f6ff; --aqua-200:#c8ecfb; --aqua-300:#a8dff4; --aqua-deep:#5fbede;
+  --pink-50:#fff5f9; --pink-100:#ffe6f0; --pink-200:#ffd0e3; --pink-300:#ffb3d1; --pink-400:#ff8fbb; --pink-deep:#e2608f;
+  --milk:#fffdfe; --ink:#57435c; --ink-soft:#8a7690; --ink-faint:#b3a3b8;
+  --ok:#3fae8a; --ok-deep:#2b8f6f; --warn:#e0872f; --warn-bg:#fff3e2;
+  --shadow-s:0 2px 6px rgba(190,140,175,.16);
+  --shadow-m:0 8px 20px rgba(180,130,170,.18);
+  --r-l:24px; --r-m:16px; --r-s:11px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  font-family:"M PLUS Rounded 1c","Hiragino Maru Gothic ProN",-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic",system-ui,sans-serif;
+  color:var(--ink); font-size:16px; line-height:1.6; min-height:100vh;
+  background:
+    radial-gradient(circle at 10% 0%, #fff1f8 0%, rgba(255,241,248,0) 40%),
+    radial-gradient(circle at 92% 4%, #e6f9ff 0%, rgba(230,249,255,0) 42%),
+    linear-gradient(180deg,#f7fdff 0%, #fdf7fb 48%, #f4fbff 100%);
+  background-attachment:fixed;
+  padding:0 0 calc(30px + env(safe-area-inset-bottom));
+}
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image:radial-gradient(rgba(255,179,209,.26) 1.4px, transparent 1.5px),
+                   radial-gradient(rgba(168,223,244,.30) 1.3px, transparent 1.4px);
+  background-size:26px 26px, 26px 26px;
+  background-position:0 0, 13px 13px;
+  opacity:.5;
+}
+.wrap{position:relative; z-index:1; max-width:640px; margin:0 auto; padding:12px 14px 0}
+[hidden]{display:none!important}
+
+/* ===== ヘッダー ===== */
+header{
+  position:relative; margin:6px 0 14px; padding:20px 18px 16px;
+  background:linear-gradient(158deg,#ffffff 0%, #fff8fc 55%, #eefaff 100%);
+  border-radius:30px; border:2px solid #fff; box-shadow:var(--shadow-m); overflow:hidden;
+}
+header::after{
+  content:""; position:absolute; inset:6px; border-radius:24px; pointer-events:none;
+  border:1.5px dashed rgba(255,179,209,.5);
+}
+header > *{position:relative; z-index:2}
+.kicker{
+  display:inline-flex; align-items:center; gap:6px; font-size:10.5px; font-weight:800;
+  letter-spacing:.14em; color:#cf6a94; background:var(--pink-100);
+  border:1.5px solid #fff; border-radius:999px; padding:3px 11px; box-shadow:var(--shadow-s);
+}
+h1{
+  margin:8px 0 2px; font-size:clamp(24px,7vw,30px); font-weight:800; letter-spacing:.01em;
+  color:#4b3650; display:flex; align-items:center; gap:8px; text-shadow:0 1px 0 #fff;
+}
+.intro{margin:2px 0 14px; font-size:13px; color:var(--ink-soft); font-weight:500}
+
+/* ステップ */
+.steps{display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin:0 0 14px}
+.step{
+  display:flex; flex-direction:column; align-items:center; justify-content:flex-start; gap:4px;
+  font-size:11px; font-weight:800; line-height:1.3; text-align:center;
+  color:#6d5673; background:linear-gradient(180deg,#fff,#f7fcff); border:1.5px solid #e8f6fd;
+  border-radius:16px; padding:9px 5px 8px; box-shadow:var(--shadow-s);
+}
+.step b{
+  display:grid; place-items:center; width:20px; height:20px; border-radius:50%;
+  font-size:11px; color:#fff; background:linear-gradient(180deg,#a8dff4,#7cc9e6);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.7);
+}
+.step.s2 b{background:linear-gradient(180deg,#ffb3d1,#ff8fbb)}
+.step.s3 b{background:linear-gradient(180deg,#9fe3cd,#3fae8a)}
+.steps .arrow{display:none}
+
+.sister{
+  display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:800;
+  color:#367a92; text-decoration:none; background:#f0fbff; border:1.5px solid #d9f1fb;
+  border-radius:999px; padding:7px 13px; box-shadow:var(--shadow-s);
+}
+.sister:active{transform:translateY(1px)}
+
+/* ===== アップロード ===== */
+.picker{
+  margin:0 0 14px; padding:14px; border-radius:var(--r-l); background:rgba(255,255,255,.78);
+  border:2px solid #fff; box-shadow:var(--shadow-m); position:relative;
+}
+.upload{
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:1px;
+  min-height:106px; padding:15px; cursor:pointer; text-align:center;
+  font-size:16.5px; font-weight:800; color:#4b3650; border-radius:20px; border:2px solid #fff;
+  background:linear-gradient(160deg,#e4f7ff 0%, #fdf1f8 52%, #ffe4ef 100%);
+  box-shadow:0 4px 0 #f2cade, 0 10px 22px rgba(180,160,200,.26), inset 0 1px 0 #fff;
+  transition:transform .12s ease, box-shadow .12s ease;
+}
+.upload:active{transform:translateY(3px); box-shadow:0 1px 0 #f2cade, 0 4px 10px rgba(180,160,200,.2), inset 0 1px 0 #fff}
+.upload .ic{font-size:28px; line-height:1.1; margin-bottom:1px}
+.upload .sub{font-size:11.5px; font-weight:700; color:#8a7690}
+.upload:has(input:disabled){opacity:.6; pointer-events:none}
+#files{position:absolute; width:1px; height:1px; opacity:0; pointer-events:none}
+
+#status{display:block; margin:12px 2px 0; font-size:13px; font-weight:700; line-height:1.5; color:#4f7d90;
+  background:#f1fbff; border:1.5px dashed #c9ecf9; border-radius:14px; padding:9px 12px}
+#status:empty{display:none}
+.hint{display:block; margin:9px 2px 0; font-size:11.5px; color:var(--ink-faint); font-weight:600}
+
+/* ===== 読み取りカード ===== */
+#rows{display:grid; gap:12px}
+#rows > details{
+  position:relative; border-radius:var(--r-l); padding:14px 14px 12px;
+  background:linear-gradient(165deg,#ffffff 0%, #fffbfd 60%, #f4fcff 100%);
+  border:2px solid #fff; box-shadow:var(--shadow-m); overflow:hidden;
+}
+#rows > details::before{
+  content:""; position:absolute; inset:5px; border-radius:19px; pointer-events:none;
+  border:1.4px dashed rgba(255,179,209,.42);
+}
+#rows > details[open]{box-shadow:0 8px 22px rgba(160,200,225,.26), 0 0 0 2px #e3f6fe, inset 0 0 0 2px #fff}
+#rows > details > summary{
+  position:relative; z-index:2; cursor:pointer; list-style:none; padding-right:22px;
+  font-size:14.5px; font-weight:800; color:#4b3650; line-height:1.45;
+}
+#rows > details > summary::-webkit-details-marker{display:none}
+#rows > details > summary::after{
+  content:"⌄"; position:absolute; right:2px; top:-2px; font-size:17px; color:var(--pink-400);
+  font-weight:800; transition:transform .18s ease;
+}
+#rows > details[open] > summary::after{transform:rotate(180deg)}
+#rows > details > details{margin:11px 0 0; position:relative; z-index:2}
+#rows > details > details > summary{
+  cursor:pointer; list-style:none; font-size:11.5px; font-weight:800; color:#367a92;
+  background:#eefaff; border:1.5px solid #dbf2fb; border-radius:999px;
+  padding:5px 12px; display:inline-block;
+}
+#rows > details > details > summary::-webkit-details-marker{display:none}
+img{display:block; max-width:100%; max-height:55vh; margin:10px auto 0; border-radius:14px; box-shadow:var(--shadow-s)}
+
+#rows section{
+  display:grid; grid-template-columns:1fr; gap:10px; margin:12px 0 0; position:relative; z-index:2;
+}
+@media(min-width:520px){#rows section{grid-template-columns:repeat(2,minmax(0,1fr))}}
+#rows label{display:block; font-size:11.5px; font-weight:800; color:var(--ink-soft); letter-spacing:.02em}
+input,select,textarea{
+  width:100%; margin-top:4px; font-family:inherit; font-size:16px; font-weight:700; color:#3f3145;
+  border:1.6px solid #dbe8ee; border-radius:12px; background:#fff; padding:9px 10px;
+  box-shadow:inset 0 1px 3px rgba(150,180,200,.12); appearance:none; -webkit-appearance:none;
+}
+select{
+  background-image:linear-gradient(45deg,transparent 50%,#9fc3d2 50%),linear-gradient(135deg,#9fc3d2 50%,transparent 50%);
+  background-position:calc(100% - 15px) 50%, calc(100% - 10px) 50%;
+  background-size:5px 5px, 5px 5px; background-repeat:no-repeat; padding-right:28px;
+}
+input:focus,select:focus,textarea:focus{outline:none; border-color:var(--aqua-300); box-shadow:0 0 0 3px rgba(168,223,244,.4)}
+select:invalid,input:invalid{border-color:#e9a86b; background:#fffaf4}
+textarea{min-height:7em; font-size:13px; font-weight:600; font-family:ui-monospace,Menlo,monospace; line-height:1.5}
+
+/* 削除ボタン（JS生成） */
+#rows > details > button{
+  position:relative; z-index:2; display:block; margin:12px 0 0 auto;
+  font-family:inherit; font-size:11.5px; font-weight:800; color:#b4677f; cursor:pointer;
+  background:#fff6fa; border:1.5px solid #ffdbe8; border-radius:999px; padding:7px 14px;
+}
+#rows > details > button:active{background:#ffe9f2}
+
+/* ===== 出力 ===== */
+#exportArea{margin:14px 0}
+.export-card{
+  padding:15px; border-radius:var(--r-l); background:linear-gradient(160deg,#ffffff,#fff9fc 60%,#f1fbff);
+  border:2px solid #fff; box-shadow:0 8px 22px rgba(255,160,200,.24), 0 0 0 2px #ffe4ef inset;
+}
+.tools{display:flex; gap:8px; flex-wrap:wrap; margin:0 0 4px}
+button{
+  font-family:inherit; font-weight:800; font-size:14px; cursor:pointer; border:0;
+  border-radius:999px; padding:12px 17px; min-height:46px; color:#7a4b63;
+  background:linear-gradient(180deg,#fff,#ffeef6);
+  box-shadow:0 3px 0 #ffd3e5, 0 6px 14px rgba(255,160,200,.24), inset 0 1px 0 #fff;
+  transition:transform .1s ease, box-shadow .1s ease;
+}
+button:active{transform:translateY(3px); box-shadow:0 0 0 #ffd3e5, 0 3px 8px rgba(255,160,200,.2), inset 0 1px 0 #fff}
+button.primary{
+  color:#fff; background:linear-gradient(180deg,#ffa8cb,#ff85b6 55%,#ff739f);
+  box-shadow:0 4px 0 #d9588a, 0 8px 18px rgba(255,120,170,.34), inset 0 1px 0 rgba(255,255,255,.6);
+}
+button.ok{
+  color:#fff; background:linear-gradient(180deg,#8fe0c4,#46b894 60%,#3aab88);
+  box-shadow:0 4px 0 #2b8f6f, 0 8px 18px rgba(70,184,148,.3), inset 0 1px 0 rgba(255,255,255,.6);
+}
+button:disabled{opacity:.45; pointer-events:none}
+a{
+  display:inline-block; margin-top:12px; font-size:13px; font-weight:800; color:#2c7f9b;
+  text-decoration:none; background:#effaff; border:1.5px solid #d6effa; border-radius:999px; padding:8px 14px;
+}
+a:active{background:#e3f7ff}
+#exportArea small{display:block; margin-top:10px; font-size:11.5px; line-height:1.55; color:var(--ink-faint); font-weight:600}
+#fallback{margin-top:12px}
+
+/* ===== データ管理 ===== */
+#management{
+  margin:18px 0 0; padding:0; border-radius:var(--r-l);
+  background:rgba(255,255,255,.8); border:2px solid #fff; box-shadow:var(--shadow-s); overflow:hidden;
+}
+#management > summary{
+  cursor:pointer; list-style:none; padding:15px 16px; font-size:13.5px; font-weight:800; color:#6d5673;
+  display:flex; align-items:center; gap:7px;
+}
+#management > summary::-webkit-details-marker{display:none}
+#management > summary::after{content:"⌄"; margin-left:auto; color:var(--ink-faint); font-size:15px}
+#management[open] > summary{border-bottom:1.5px dashed #ffe0ee; margin-bottom:12px}
+#management > *{position:relative}
+#management > :not(summary){margin-left:16px; margin-right:16px}
+#management label{display:block; font-size:12px; font-weight:800; color:var(--ink-soft); margin-top:6px}
+#management small{display:block; margin:6px 0 10px; font-size:11.5px; color:var(--ink-faint); font-weight:600; line-height:1.55}
+#management p{font-size:11.5px; color:var(--ink-soft); font-weight:600; margin:8px 0}
+#management > details{margin-bottom:14px; border-top:1.5px dashed #ffe0ee; padding-top:10px}
+#management > details > summary{
+  cursor:pointer; list-style:none; font-size:12.5px; font-weight:800; color:#b4677f;
+  background:#fff6fa; border:1.5px solid #ffdbe8; border-radius:999px; padding:8px 14px; display:inline-block;
+}
+#management > details > summary::-webkit-details-marker{display:none}
+#management .tools{margin:10px 0 0}
+#management button{font-size:12.5px; padding:9px 14px; min-height:40px}
+#trashList div{
+  margin-top:9px; padding:11px 12px; border-radius:14px; background:#fffafc;
+  border:1.5px solid #ffe4ef; display:flex; flex-wrap:wrap; gap:6px; align-items:center;
+}
+#trashList p{flex:1 1 100%; margin:0 0 2px; font-size:11.5px; color:#6d5673; font-weight:700; line-height:1.45}
+#trashList button{font-size:11px; padding:7px 11px; min-height:34px; border-radius:999px}
+#trashList button:last-child{color:#a8506c; background:#fff1f6; box-shadow:0 2px 0 #ffd3e5}
+#count{font-weight:800; color:#367a92}
+#backupStatus{background:#f6fcff; border:1.5px dashed #d9f1fb; border-radius:12px; padding:9px 11px; color:#4f7d90; font-size:11.5px}
+
+footer{margin:20px 4px 0; text-align:center; font-size:10.5px; color:var(--ink-faint); font-weight:600; line-height:1.7}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <span class="kicker">POKÉSLEEP TOOL</span>
+  <h1>📸 個体スキャン</h1>
+  <p class="intro">スクショをデータ化して、にとよんCSVにまとめるよ</p>
+  <div class="steps">
+    <span class="step"><b>1</b> スクショを選ぶ</span>
+    <span class="step s2"><b>2</b> 確認・保存</span>
+    <span class="step s3"><b>3</b> にとよんへ貼る</span>
+  </div>
+  <a class="sister" href="https://eineichan.github.io/pokesleep-role/">📋 ポケスリ役割チェック</a>
+</header>
+
+<main>
+  <div class="picker">
+    <label class="upload"><span class="ic">📷</span><span>スクショを選ぶ</span><span class="sub">まとめて選んでOK</span><input id="files" type="file" multiple accept="image/*"></label>
+    <output id="status" aria-live="polite"></output>
+    <small class="hint">読み取り結果と修正は自動保存されます。</small>
+  </div>
+
+  <div id="rows"></div>
+
+  <div id="exportArea" hidden>
+    <div class="export-card">
+      <div class="tools">
+        <button id="copy" class="primary">CSVをコピー</button>
+        <button id="save">CSVを保存</button>
+        <button hidden id="mark" class="ok">にとよんへの登録完了</button>
+      </div>
+      <textarea hidden id="fallback" readonly></textarea>
+      <a href="https://nitoyon.github.io/pokesleep-tool/iv/" target="_blank" rel="noopener">にとよんのボックスを開く</a>
+      <small>新規の個体だけ出力します。にとよんの「インポート」で読み込んでください。</small>
+    </div>
+  </div>
+
+  <details id="management">
+    <summary>⚙️ データ管理</summary>
+    <label>にとよんの既存CSV（日本語）<input id="base" type="file" accept=".csv"></label>
+    <small id="count"></small>
+    <p id="backupStatus"></p>
+    <div class="tools"><button id="backup">バックアップを保存</button></div>
+    <label>バックアップから復元<input type="file" id="restore" accept=".json"></label>
+    <small>現在の記録を保持して未登録分を追加します。</small>
+    <details>
+      <summary id="trashCount">ごみ箱（0件）</summary>
+      <p>「完全に削除」すると元に戻せません。元の写真や、にとよん側のデータは削除しません。</p>
+      <div id="trashList"></div>
+    </details>
+  </details>
+</main>
+
+<footer>データはこの端末・このブラウザに保存されます。<br>取り込み後はバックアップJSONを保存しておいてね。</footer>
+
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
