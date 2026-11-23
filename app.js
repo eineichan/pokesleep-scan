@@ -70,8 +70,8 @@ function add(file,url,match,r,hash,draft={}){
  const edit=()=>{refresh();persist().catch(report)};
  controls.forEach(el=>el.oninput=edit);
  controls[1].onchange=()=>{const m=db.mons.find(m=>m.name===controls[1].value);if(m){controls[7].value=m.skill;if(m.foods[0])controls[4].value=m.foods[0];if(match.key){try{const all=JSON.parse(localStorage.iconLabels||'{}');all[match.key]=m.name;localStorage.iconLabels=JSON.stringify(all)}catch{}}}edit()};
- const remove=document.createElement('button');remove.textContent='削除';remove.onclick=()=>deleteItem('drafts',hash); det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
- $('rows').append(det);const entry={det,controls,hash,url,refresh,persist};entries.push(entry);$('exportArea').hidden=false;return entry;
+ const remove=document.createElement('button');remove.textContent='削除'; det.append(summary,pic,grid,remove);refresh();det.open=!match.confident||controls.some(e=>!e.validity.valid);
+ $('rows').append(det);const entry={det,controls,hash,url,refresh,persist,remove};entries.push(entry);remove.onclick=()=>deleteItem('drafts',hash,entry);$('exportArea').hidden=false;return entry;
 }
 async function run(files){
  if(!files.length)return;
@@ -149,6 +149,15 @@ backupStatus();
 // Check public data in the background; keep the working catalog on any failure.
 checkCatalog(bundled,{storage:catalogStorage}).catch(()=>{});
 
-async function deleteItem(table,id){
- try{await transaction(database,[table],t=>t.objectStore(table).delete(id));await init();message('削除しました。')}catch(e){report(e)}
+async function deleteItem(table,id,entry){
+ try{
+  if(table==='drafts'){
+   const rest=entries.filter(e=>e.hash===id&&e!==entry),i=entries.indexOf(entry);
+   if(i>=0)entries.splice(i,1);
+   if(entry){entry.det.remove();if(entry.url)URL.revokeObjectURL(entry.url)}
+   if(!rest.length)await transaction(database,[table],t=>t.objectStore(table).delete(id));
+   $('exportArea').hidden=!entries.length;message('削除しました。');return
+  }
+  await transaction(database,[table],t=>t.objectStore(table).delete(id));await init();message('削除しました。')
+ }catch(e){report(e)}
 }
